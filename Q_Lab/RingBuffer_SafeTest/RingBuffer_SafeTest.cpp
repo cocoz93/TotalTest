@@ -1,5 +1,4 @@
-﻿//
-#pragma once
+//
 #include <iostream>
 #include <vector>
 #include <atomic>
@@ -9,9 +8,8 @@
 #include <thread>
 #include <mutex>
 #include <memory> 
-#include <set>
 #include <string>
-#include "../RingBuffer.h"
+#include "RingBuffer.h"
 
 //=============================================================================
 // 테스트 설정 상수 (반복 횟수 조절 가능)
@@ -25,7 +23,6 @@ namespace TestConfig
 
     // Phase 2: 멀티스레드 테스트
 	const uint64_t NUMBERS_PER_THREAD = 10'000'000; // 각 생산자 스레드가 생성할 숫자 개수 (Producer-Consumer)
-    const uint64_t PEEK_CONSUME_PER_THREAD = 10'000'000; // 각 생산자 스레드가 생성할 숫자 개수 (Peek+Consume)
     const uint64_t HIGH_CONTENTION_OPS_PER_THREAD = 10'000'000; // 각 스레드당 작업 횟수 (고빈도 경합)
 
     // 진행 상황 출력 주기
@@ -380,7 +377,7 @@ void Test_BoundaryConditions()
             PrintProgress("경계값 초과", i, ITERATIONS);
 
             size_t written = container->Enqueue(overData.data(), overData.size());
-            TEST_ASSERT(written <= 511, "capacity 초과 쓰기 허용됨");
+            TEST_ASSERT(written == 0, "capacity 초과 쓰기 허용됨");
 
             container->Clear();
             char readBuf[10];
@@ -415,17 +412,15 @@ void Test_BoundaryConditions()
 void RunProducerConsumerTest(
 	int producerCount,  // 생산자 스레드 수
 	int consumerCount,  // 소비자 스레드 수
-	int numbersPerThread, // 각 생산자 스레드가 생성할 숫자 개수
+	int64_t numbersPerThread, // 각 생산자 스레드가 생성할 숫자 개수
     const std::vector<std::string>& completedLines,
     const std::string& runningLine)
 {
-	const int TOTAL_NUMBERS = numbersPerThread * producerCount; // 전체 숫자 개수
+	const int64_t TOTAL_NUMBERS = numbersPerThread * producerCount; // 전체 숫자 개수
     std::atomic<uint64_t> totalEnqueued(0);
     std::atomic<uint64_t> totalDequeued(0); 
 
     std::atomic<bool> allProducersDone(false);
-    std::atomic<int> producersCompleted(0);    
-    std::atomic<int> consumersCompleted(0);
 
     auto container = std::make_unique<CRingBufferMT>(65536);
     if (!container->IsValid())
@@ -443,7 +438,7 @@ void RunProducerConsumerTest(
     }
 
     // dequeueCheck 초기화
-    for (int i = 0; i < TOTAL_NUMBERS; i++)
+    for (int64_t i = 0; i < TOTAL_NUMBERS; i++)
         dequeueCheck[i] = 0;
 
     // 진행률 출력 스레드
@@ -475,7 +470,13 @@ void RunProducerConsumerTest(
         }
     });
 
+    // 스레드 생성 전에 시드를 미리 생성 (std::random_device는 thread-safe 보장 안 됨)
     std::random_device rd;
+    std::vector<unsigned int> producerSeeds(producerCount);
+    std::vector<unsigned int> consumerSeeds(consumerCount);
+    for (int i = 0; i < producerCount; i++) producerSeeds[i] = rd();
+    for (int i = 0; i < consumerCount; i++) consumerSeeds[i] = rd();
+
     std::vector<std::thread> producers;
     std::vector<std::thread> consumers;
 
@@ -486,22 +487,22 @@ void RunProducerConsumerTest(
     {
         producers.emplace_back([&, threadId]()
         {
-            std::mt19937 gen(rd() + threadId);
+            std::mt19937 gen(producerSeeds[threadId]);
             std::uniform_int_distribution<> sizeDis(1, 32);  // 1~32개 숫자 (8~256바이트)
 
-            int startNum = threadId * numbersPerThread;
-            int endNum = startNum + numbersPerThread;
-            int currentNum = startNum;
+            int64_t startNum = (int64_t)threadId * numbersPerThread;
+            int64_t endNum = startNum + numbersPerThread;
+            int64_t currentNum = startNum;
 
             while (currentNum < endNum)
             {
                 // 랜덤 개수만큼 숫자 묶음 생성 (8~256바이트)
-                int batchSize = (std::min)(sizeDis(gen), endNum - currentNum);
+                int64_t batchSize = (std::min)((int64_t)sizeDis(gen), endNum - currentNum);
                 std::vector<int> batch;
 
-                for (int i = 0; i < batchSize; i++)
+                for (int64_t i = 0; i < batchSize; i++)
                 {
-                    batch.push_back(currentNum + i);
+                    batch.push_back(static_cast<int>(currentNum + i));
                 }
 
                 size_t totalSize = batch.size() * sizeof(int);
@@ -519,7 +520,6 @@ void RunProducerConsumerTest(
                 currentNum += batchSize;
                 totalEnqueued += batchSize;
             }
-            ++producersCompleted;
         });
     }
 
@@ -528,14 +528,14 @@ void RunProducerConsumerTest(
     {
         consumers.emplace_back([&, consumerId]()
         {
-            std::mt19937 gen(rd() + 1000 + consumerId);
+            std::mt19937 gen(consumerSeeds[consumerId]);
             std::uniform_int_distribution<> sizeDis(1, 32);
             std::vector<int> readBuffer(32);
 
             while (true)
             {
 				// 종료 조건 확인
-                if (allProducersDone && totalDequeued >= TOTAL_NUMBERS)
+                if (allProducersDone && totalDequeued >= (uint64_t)TOTAL_NUMBERS)
                 {
                     break;
                 }
@@ -565,7 +565,6 @@ void RunProducerConsumerTest(
                 }
                 totalDequeued += numCount;
             }
-            ++consumersCompleted;
         });
     }
 
@@ -580,10 +579,6 @@ void RunProducerConsumerTest(
     running = false;
     progressThread.join();
 
-    // 최종 검증 시작 전 진행률 출력 일시 중지
-    pauseProgress = true;
-    std::this_thread::sleep_for(std::chrono::milliseconds(600)); // cls 끝날 때까지 대기
-
     auto endTime = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
 
@@ -593,15 +588,15 @@ void RunProducerConsumerTest(
     std::cout << "========================================" << std::endl;
 
     // 1. 총 개수 일치
-    TEST_ASSERT(totalEnqueued == TOTAL_NUMBERS, "Enqueue 개수 불일치");
-    TEST_ASSERT(totalDequeued == TOTAL_NUMBERS, "Dequeue 개수 불일치");
+    TEST_ASSERT(totalEnqueued == (uint64_t)TOTAL_NUMBERS, "Enqueue 개수 불일치");
+    TEST_ASSERT(totalDequeued == (uint64_t)TOTAL_NUMBERS, "Dequeue 개수 불일치");
     std::cout << "  > Enqueue/Dequeue 개수 일치: " << TOTAL_NUMBERS << " 개" << std::endl;
 
     // 2. 모든 숫자가 정확히 1번씩 처리되었는지 확인
     int missingCount = 0;
     int duplicateCount = 0;
 
-    for (int i = 0; i < TOTAL_NUMBERS; i++)
+    for (int64_t i = 0; i < TOTAL_NUMBERS; i++)
     {
         int status = dequeueCheck[i];
         if (status == 0)
@@ -620,7 +615,7 @@ void RunProducerConsumerTest(
     TEST_ASSERT(duplicateCount == 0, "중복 처리된 숫자 발견");
     std::cout << "  > 모든 숫자 정확히 1번씩 처리 완료" << std::endl;
 
-    TEST_ASSERT(container->GetDataSize() == 0, "버퍼가 완전히 비워지지 않음");
+    TEST_ASSERT(container->IsEmpty(), "버퍼가 완전히 비워지지 않음");
     std::cout << "  > 버퍼 완전히 비워짐" << std::endl;
 
     std::cout << "\n[PASS] Producer " << producerCount << " / Consumer " << consumerCount << " 완료 (소요: " << elapsed << "초)" << std::endl;
@@ -688,9 +683,31 @@ void Test_ProducerConsumer()
 //=============================================================================
 
 //=============================================================================
-// Phase 2-2: 멀티스레드 - 고빈도 경합 테스트 (다양한 스레드 조합)
-// 모든 스레드가 동시에 1바이트씩 Enqueue/Dequeue 반복
+// Phase 2-2: 멀티스레드 - 고빈도 경합 + 데이터 무결성 테스트
+// 16바이트 패킷(magic+checksum)으로 경합 + 무결성 + wrap-around 동시 검증
 //=============================================================================
+
+struct ContentionPacket
+{
+    uint32_t magic;
+    uint32_t threadId;
+    uint32_t sequence;
+    uint32_t checksum;
+
+    void Init(uint32_t tid, uint32_t seq)
+    {
+        magic = 0xDEADBEEF;
+        threadId = tid;
+        sequence = seq;
+        checksum = magic ^ threadId ^ sequence;
+    }
+
+    bool Verify() const
+    {
+        return magic == 0xDEADBEEF && checksum == (magic ^ threadId ^ sequence);
+    }
+};
+static_assert(sizeof(ContentionPacket) == 16, "ContentionPacket must be 16 bytes");
 
 // 파라미터화된 고빈도 경합 테스트 함수
 void RunHighContentionTest(
@@ -702,6 +719,7 @@ void RunHighContentionTest(
     auto container = std::make_unique<CRingBufferMT>(1024);
     std::atomic<uint64_t> enqueueCount(0);
     std::atomic<uint64_t> dequeueCount(0);
+    std::atomic<uint64_t> totalAttempts(0);
 
     // 진행률 출력 스레드
     std::atomic<bool> running(true);
@@ -717,7 +735,7 @@ void RunHighContentionTest(
                 system("clear");
 #endif
                 std::cout << "========================================" << std::endl;
-                std::cout << "[Phase 2-2] 고빈도 경합 테스트" << std::endl;
+                std::cout << "[Phase 2-2] 고빈도 경합 + 무결성 테스트" << std::endl;
                 std::cout << "========================================" << std::endl;
                 for (size_t j = 0; j < completedLines.size(); ++j)
                 {
@@ -725,14 +743,14 @@ void RunHighContentionTest(
                 }
                 std::cout << runningLine << std::endl;
                 
-                uint64_t totalOps = opsPerThread * threadCount;
-                uint64_t currentOps = enqueueCount + dequeueCount;
-                double progress = (double)currentOps / totalOps * 100.0;
+                uint64_t total = opsPerThread * threadCount;
+                uint64_t current = totalAttempts.load();
+                double progress = (double)current / total * 100.0;
                 
-                std::cout << "[진행률] " << currentOps << " / " << totalOps 
+                std::cout << "[진행률] " << current << " / " << total 
                           << " (" << progress << "%)" << std::endl;
-                std::cout << "  - Enqueue: " << enqueueCount << std::endl;
-                std::cout << "  - Dequeue: " << dequeueCount << std::endl;
+                std::cout << "  - Enqueue 성공: " << enqueueCount << std::endl;
+                std::cout << "  - Dequeue 성공: " << dequeueCount << std::endl;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
@@ -741,32 +759,50 @@ void RunHighContentionTest(
     std::vector<std::thread> threads;
     auto startTime = std::chrono::steady_clock::now();
 
-    // 모든 스레드가 동시에 1바이트씩 Enqueue/Dequeue 반복
+    // 짝수 스레드: 16바이트 패킷 Enqueue, 홀수 스레드: Dequeue + 무결성 검증
     for (int i = 0; i < threadCount; i++)
     {
         threads.emplace_back([&, i]() {
-            char byte = static_cast<char>(i);
-            char readByte;
+            uint32_t seq = 0;
 
             for (uint64_t j = 0; j < opsPerThread; j++)
             {
-                // 짝수 스레드: Enqueue
+                totalAttempts++;
+
                 if (i % 2 == 0)
                 {
-                    if (container->Enqueue(&byte, 1) == 1)
+                    ContentionPacket pkt;
+                    pkt.Init(static_cast<uint32_t>(i), seq++);
+                    if (container->Enqueue(&pkt, sizeof(pkt)) == sizeof(pkt))
                         enqueueCount++;
                 }
-                // 홀수 스레드: Dequeue
                 else
                 {
-                    if (container->Dequeue(&readByte, 1) == 1)
+                    ContentionPacket pkt;
+                    if (container->Dequeue(&pkt, sizeof(pkt)) == sizeof(pkt))
+                    {
+                        TEST_ASSERT(pkt.Verify(),
+                            "데이터 무결성 위반: magic=0x" + std::to_string(pkt.magic)
+                            + " thread=" + std::to_string(pkt.threadId)
+                            + " seq=" + std::to_string(pkt.sequence));
                         dequeueCount++;
+                    }
                 }
             }
         });
     }
 
     for (auto& t : threads) t.join();
+
+    // 잔여 데이터 회수 + 무결성 검증
+    ContentionPacket drainPkt;
+    uint64_t drainCount = 0;
+    while (container->Dequeue(&drainPkt, sizeof(drainPkt)) == sizeof(drainPkt))
+    {
+        TEST_ASSERT(drainPkt.Verify(), "잔여 패킷 무결성 위반");
+        drainCount++;
+    }
+    dequeueCount += drainCount;
 
     // 진행률 출력 중지
     pauseProgress = true;
@@ -783,18 +819,23 @@ void RunHighContentionTest(
     std::cout << "[최종 검증]" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    uint64_t totalSuccess = enqueueCount + dequeueCount;
-    std::cout << "  > 총 성공 작업: " << totalSuccess << " 개" << std::endl;
-    std::cout << "  > Enqueue 성공: " << enqueueCount << " 개" << std::endl;
-    std::cout << "  > Dequeue 성공: " << dequeueCount << " 개" << std::endl;
+    uint64_t finalEnq = enqueueCount.load();
+    uint64_t finalDeq = dequeueCount.load();
+
+    TEST_ASSERT(finalDeq == finalEnq, "Enqueue/Dequeue 개수 불일치");
+    TEST_ASSERT(container->IsEmpty(), "버퍼가 완전히 비워지지 않음");
+
+    std::cout << "  > Enqueue 성공: " << finalEnq << " 패킷" << std::endl;
+    std::cout << "  > Dequeue 성공: " << finalDeq << " 패킷 (잔여 회수: " << drainCount << ")" << std::endl;
+    std::cout << "  > 데이터 무결성: 모든 패킷 검증 통과 (16바이트 magic+checksum)" << std::endl;
     std::cout << "  > 소요 시간: " << elapsed << " ms" << std::endl;
     
     if (elapsed > 0)
     {
-        std::cout << "  > 처리량: " << (totalSuccess * 1000 / elapsed) << " ops/sec" << std::endl;
+        std::cout << "  > 처리량: " << (finalEnq * 1000 / elapsed) << " packets/sec" << std::endl;
     }
 
-    std::cout << "\n[PASS] " << threadCount << "개 스레드 고빈도 경합 완료 (소요: " 
+    std::cout << "\n[PASS] " << threadCount << "개 스레드 고빈도 경합 + 무결성 완료 (소요: " 
               << elapsed / 1000.0 << "초)" << std::endl;
     std::cout << "========================================" << std::endl;
 
@@ -857,6 +898,44 @@ void Test_HighContentionFalseSharing()
 }
 
 //=============================================================================
+// Phase 1-4: 잘못된 사용 패턴 방어 테스트
+//=============================================================================
+void Test_InvalidUsageDefense()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 1-4] 잘못된 사용 패턴 방어 테스트" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    auto container = std::make_unique<CRingBufferST>(1024);
+
+    // 1. nullptr 전달
+    TEST_ASSERT(container->Enqueue(nullptr, 100) == 0, "nullptr Enqueue 허용됨");
+    TEST_ASSERT(container->Dequeue(nullptr, 100) == 0, "nullptr Dequeue 허용됨");
+    TEST_ASSERT(container->Peek(nullptr, 100) == 0, "nullptr Peek 허용됨");
+    std::cout << "  > nullptr 방어: OK" << std::endl;
+
+    // 2. size = 0 전달
+    char dummy;
+    TEST_ASSERT(container->Enqueue(&dummy, 0) == 0, "크기 0 Enqueue 허용됨");
+    TEST_ASSERT(container->Dequeue(&dummy, 0) == 0, "크기 0 Dequeue 허용됨");
+    std::cout << "  > 크기 0 방어: OK" << std::endl;
+
+    // 3. 잘못된 capacity로 생성
+    auto invalidContainer = std::make_unique<CRingBufferST>(0);
+    TEST_ASSERT(!invalidContainer->IsValid(), "잘못된 capacity 허용됨");
+    std::cout << "  > 잘못된 생성 방어: OK" << std::endl;
+
+    // 4. 버퍼 오버플로우 시도
+    std::vector<char> overData(2048);
+    size_t written = container->Enqueue(overData.data(), overData.size());
+    TEST_ASSERT(written == 0, "capacity 초과 쓰기 허용됨");
+    std::cout << "  > 오버플로우 방어: OK" << std::endl;
+
+    std::cout << "[PASS] 잘못된 사용 패턴 방어 완료" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
 // 메뉴 출력
 //=============================================================================
 void PrintMenu()
@@ -868,13 +947,14 @@ void PrintMenu()
     std::cout << "  1. 데이터 무결성 테스트 (1억 번)" << std::endl;
     std::cout << "  2. 불변성 검증 테스트 (1억 번)" << std::endl;
     std::cout << "  3. 경계 조건 테스트 (1억 번)" << std::endl;
-    std::cout << "  4. Phase 1 전체 실행" << std::endl;
+    std::cout << "  4. 잘못된 사용 패턴 방어 테스트" << std::endl;
+    std::cout << "  5. Phase 1 전체 실행" << std::endl;
     std::cout << "\n[Phase 2: 멀티스레드 검증]" << std::endl;
-    std::cout << "  5. Producer-Consumer 테스트 (1억 바이트)" << std::endl;
-    std::cout << "  6. 고빈도 경합 테스트" << std::endl;
-    std::cout << "  7. Phase 2 전체 실행" << std::endl;
+    std::cout << "  6. Producer-Consumer 테스트 (1억 바이트)" << std::endl;
+    std::cout << "  7. 고빈도 경합 테스트" << std::endl;
+    std::cout << "  8. Phase 2 전체 실행" << std::endl;
     std::cout << "\n[전체]" << std::endl;
-    std::cout << "  8. 전체 테스트 실행 (Phase 1 + Phase 2)" << std::endl;
+    std::cout << "  9. 전체 테스트 실행 (Phase 1 + Phase 2)" << std::endl;
     std::cout << "  0. 종료" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "선택: ";
@@ -920,27 +1000,32 @@ int main()
                 Test_BoundaryConditions();
                 break;
             case 4:
+                Test_InvalidUsageDefense();
+                break;
+            case 5:
                 std::cout << "\n[Phase 1 전체 실행]" << std::endl;
                 Test_DataIntegrity();
                 Test_Invariants();
                 Test_BoundaryConditions();
-                break;
-            case 5:
-                Test_ProducerConsumer();
+                Test_InvalidUsageDefense();
                 break;
             case 6:
-                Test_HighContentionFalseSharing();
+                Test_ProducerConsumer();
                 break;
             case 7:
+                Test_HighContentionFalseSharing();
+                break;
+            case 8:
                 std::cout << "\n[Phase 2 전체 실행]" << std::endl;
                 Test_ProducerConsumer();
                 Test_HighContentionFalseSharing();
                 break;
-            case 8:
+            case 9:
                 std::cout << "\n[전체 테스트 실행]" << std::endl;
                 Test_DataIntegrity();
                 Test_Invariants();
                 Test_BoundaryConditions();
+                Test_InvalidUsageDefense();
                 Test_ProducerConsumer();
                 Test_HighContentionFalseSharing();
                 break;
@@ -969,42 +1054,4 @@ int main()
     }
 
     return 0;
-}
-
-//=============================================================================
-// 잘못된 사용 패턴 방어 테스트
-//=============================================================================
-void Test_InvalidUsageDefense()
-{
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "[추가] 잘못된 사용 패턴 방어 테스트" << std::endl;
-    std::cout << "========================================" << std::endl;
-
-    auto container = std::make_unique<CRingBufferST>(1024);
-
-    // 1. nullptr 전달
-    TEST_ASSERT(container->Enqueue(nullptr, 100) == 0, "nullptr Enqueue 허용됨");
-    TEST_ASSERT(container->Dequeue(nullptr, 100) == 0, "nullptr Dequeue 허용됨");
-    TEST_ASSERT(container->Peek(nullptr, 100) == 0, "nullptr Peek 허용됨");
-    std::cout << "  > nullptr 방어: OK" << std::endl;
-
-    // 2. size = 0 전달
-    char dummy;
-    TEST_ASSERT(container->Enqueue(&dummy, 0) == 0, "크기 0 Enqueue 허용됨");
-    TEST_ASSERT(container->Dequeue(&dummy, 0) == 0, "크기 0 Dequeue 허용됨");
-    std::cout << "  > 크기 0 방어: OK" << std::endl;
-
-    // 3. 잘못된 capacity로 생성
-    auto invalidContainer = std::make_unique<CRingBufferST>(0);
-    TEST_ASSERT(!invalidContainer->IsValid(), "잘못된 capacity 허용됨");
-    std::cout << "  > 잘못된 생성 방어: OK" << std::endl;
-
-    // 4. 버퍼 오버플로우 시도
-    std::vector<char> overData(2048);
-    size_t written = container->Enqueue(overData.data(), overData.size());
-    TEST_ASSERT(written == 0, "capacity 초과 쓰기 허용됨");
-    std::cout << "  > 오버플로우 방어: OK" << std::endl;
-
-    std::cout << "[PASS] 잘못된 사용 패턴 방어 완료" << std::endl;
-    g_testCount++;
 }

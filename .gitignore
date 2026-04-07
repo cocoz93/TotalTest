@@ -1,0 +1,16 @@
+# Visual Studio 캐시 및 설정 파일 무시
+.vs/
+
+# 빌드 결과물 (x64 디렉토리 및 내부 파일 전체) 무시
+x64/
+**/x64/
+
+# 추가로 권장하는 MSVC 관련 무시 설정
+*.user
+*.aps
+*.pdb
+*.ilk
+*.log
+Debug/
+Release/
+ipch/
