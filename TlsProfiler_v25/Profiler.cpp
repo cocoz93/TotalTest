@@ -6,19 +6,19 @@
 #include "Profiler.h"
 
 // ============================================================================
-// TLS ±â¹İ °í¼º´É ¸ÖÆ¼½º·¹µå ÇÁ·ÎÆÄÀÏ·¯ ±¸Çö
+// TLS ê¸°ë°˜ ê³ ì„±ëŠ¥ ë©€í‹°ìŠ¤ë ˆë“œ í”„ë¡œíŒŒì¼ëŸ¬ êµ¬í˜„
 // ============================================================================
 
 namespace Profiler
 {
-    // ProfileData »ı¼ºÀÚ
+    // ProfileData ìƒì„±ì
     ProfileData::ProfileData()
         : name(nullptr), totalTime(0), callCount(0),
         minTime(UINT64_MAX), maxTime(0)
     {
     }
 
-    // CThreadLocalProfiler »ı¼ºÀÚ
+    // CThreadLocalProfiler ìƒì„±ì
     CThreadLocalProfiler::CThreadLocalProfiler()
         : _profileCount(0)
     {
@@ -34,7 +34,7 @@ namespace Profiler
 
         if (_profileCount >= MAX_PROFILES)
         {
-            return SIZE_MAX; // ¿À¹öÇÃ·Î¿ì ¹æÁö
+            return SIZE_MAX; // ì˜¤ë²„í”Œë¡œìš° ë°©ì§€
         }
 
         size_t index = _profileCount++;
@@ -64,7 +64,7 @@ namespace Profiler
         return _profileCount;
     }
 
-    // CProfilerManager »ı¼ºÀÚ
+    // CProfilerManager ìƒì„±ì
     CProfilerManager::CProfilerManager()
         : _enabled(true)
     {
@@ -102,7 +102,7 @@ namespace Profiler
         _enabled.store(enabled, std::memory_order_relaxed);
     }
 
-    // ¸ğµç ½º·¹µåÀÇ ÇÁ·ÎÆÄÀÏ µ¥ÀÌÅÍ Áı°è ¹× Ãâ·Â
+    // ëª¨ë“  ìŠ¤ë ˆë“œì˜ í”„ë¡œíŒŒì¼ ë°ì´í„° ì§‘ê³„ ë° ì¶œë ¥
     void CProfilerManager::PrintReport()
     {
         std::lock_guard<std::mutex> lock(_mutex);
@@ -132,7 +132,7 @@ namespace Profiler
             }
         }
 
-        // °á°ú Ãâ·Â
+        // ê²°ê³¼ ì¶œë ¥
         std::cout << "\n========== PROFILER REPORT ==========\n";
         std::cout << std::left << std::setw(30) << "Name"
             << std::right << std::setw(12) << "Calls"
@@ -160,7 +160,7 @@ namespace Profiler
         std::cout << "======================================\n\n";
     }
 
-    // TLS ÀÎ½ºÅÏ½º °ü¸®
+    // TLS ì¸ìŠ¤í„´ìŠ¤ ê´€ë¦¬
     CThreadLocalProfiler& GetThreadLocalProfiler()
     {
         thread_local struct ProfilerGuard
@@ -181,7 +181,7 @@ namespace Profiler
         return guard.profiler;
     }
 
-    // CScopedProfiler »ı¼ºÀÚ
+    // CScopedProfiler ìƒì„±ì
     CScopedProfiler::CScopedProfiler(const char* name)
         : _profiler(GetThreadLocalProfiler())
         , _enabled(CProfilerManager::Instance().IsEnabled())
@@ -193,7 +193,7 @@ namespace Profiler
         }
     }
 
-    // CScopedProfiler ¼Ò¸êÀÚ
+    // CScopedProfiler ì†Œë©¸ì
     CScopedProfiler::~CScopedProfiler()
     {
         if (_enabled)
@@ -207,6 +207,6 @@ namespace Profiler
 
 } // namespace Profiler
 
-// ÆíÀÇ ¸ÅÅ©·Î
+// í¸ì˜ ë§¤í¬ë¡œ
 #define PROFILE_SCOPE(name) Profiler::CScopedProfiler _profiler_##__LINE__(name)
 #define PROFILE_FUNCTION() PROFILE_SCOPE(__FUNCTION__)
