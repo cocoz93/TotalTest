@@ -1,11 +1,11 @@
-//
+﻿//
 #pragma once
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <algorithm>
 #include <stdexcept>
-#include <type_traits>
+
 
 // 템플릿 기본 매개변수(Default Template Argument)
 struct NoLock
@@ -21,21 +21,32 @@ struct MutexLock
     void unlock() { _mutex.unlock(); }
 };
 
-
+// __________________________________________________________________
+// 
+// NoLock 싱글스레드 버전
+// 싱글스레드 환경에서 사용
+// __________________________________________________________________
 template<typename LockPolicy = NoLock>
 class CRingBufferT
 {
 public:
-    explicit CRingBufferT(size_t capacity = 65536)
-        : _capacity(capacity)
+    explicit CRingBufferT()
+        : _capacity(0)
         , _readPos(0)
         , _writePos(0)
         , _buffer(nullptr)
     {
-        if (capacity == 0)
-            return;
+    }
 
-        _buffer = new (std::nothrow) char[_capacity];
+    // 즉시 할당 편의 생성자 — capacity>0면 Init로 버퍼 확보 (클라 등 풀링 불필요한 곳).
+    //   서버 세션 풀은 무인자 ctor(빈) + Init() 사용. 두 생성자는 오버로드라 무충돌.
+    explicit CRingBufferT(size_t capacity)
+        : _capacity(0)
+        , _readPos(0)
+        , _writePos(0)
+        , _buffer(nullptr)
+    {
+        Init(capacity);
     }
 
     ~CRingBufferT()
@@ -43,24 +54,35 @@ public:
         delete[] _buffer;
     }
 
-    CRingBufferT(const CRingBufferT&) = delete;
-    CRingBufferT& operator=(const CRingBufferT&) = delete;
+    bool Init(size_t capacity = 65535)
+    {
+        if (capacity == 0)
+            return false;
+
+        _buffer = new (std::nothrow) char[capacity];
+        if (_buffer == nullptr)
+            return false;
+
+        _capacity = capacity;
+        return true;
+    }
 
     bool IsValid() const
     {
         return _buffer != nullptr;
     }
 
-    // === Public API ===
-
     size_t Enqueue(const void* data, size_t size)
     {
-        if (data == nullptr || size == 0 || _buffer == nullptr)
-            return 0;
-
         _lock.lock();
 
-        size_t freeSize = GetFreeSizeInternal();
+        if (data == nullptr || size == 0 || _buffer == nullptr)
+        {
+            _lock.unlock();
+            return 0;
+        }
+
+        size_t freeSize = GetFreeSize_Internal();
 
         // All-or-Nothing: 전체 크기만큼 공간이 없으면 실패
         if (freeSize < size)
@@ -87,12 +109,15 @@ public:
 
     size_t Dequeue(void* data, size_t size)
     {
-        if (data == nullptr || size == 0 || _buffer == nullptr)
-            return 0;
-
         _lock.lock();
 
-        size_t dataSize = GetDataSizeInternal();
+        if (data == nullptr || size == 0 || _buffer == nullptr)
+        {
+            _lock.unlock();
+            return 0;
+        }
+
+        size_t dataSize = GetDataSize_Internal();
 
         // All-or-Nothing: 요청한 크기만큼 데이터가 없으면 실패
         if (dataSize < size)
@@ -117,15 +142,17 @@ public:
         return size;
     }
 
-    // mutable lock을 사용하여 const 함수에서도 동기화 보장
     size_t Peek(void* data, size_t size) const
     {
-        if (data == nullptr || size == 0 || _buffer == nullptr)
-            return 0;
-
         _lock.lock();
 
-        size_t dataSize = GetDataSizeInternal();
+        if (data == nullptr || size == 0 || _buffer == nullptr)
+        {
+            _lock.unlock();
+            return 0;
+        }
+
+        size_t dataSize = GetDataSize_Internal();
 
         // All-or-Nothing: 요청한 크기만큼 데이터가 없으면 실패
         if (dataSize < size)
@@ -150,12 +177,15 @@ public:
 
     size_t Consume(size_t size)
     {
-        if (size == 0 || _buffer == nullptr)
-            return 0;
-
         _lock.lock();
 
-        size_t dataSize = GetDataSizeInternal();
+        if (size == 0 || _buffer == nullptr)
+        {
+            _lock.unlock();
+            return 0;
+        }
+
+        size_t dataSize = GetDataSize_Internal();
 
         // All-or-Nothing: 요청한 크기만큼 데이터가 없으면 실패
         if (dataSize < size)
@@ -165,6 +195,31 @@ public:
         }
 
         _readPos = (_readPos + size) % _capacity;
+
+        _lock.unlock();
+        return size;
+    }
+
+    size_t MoveWritePtr(size_t size)
+    {
+        _lock.lock();
+
+        if (size == 0 || _buffer == nullptr)
+        {
+            _lock.unlock();
+            return 0;
+        }
+
+        size_t freeSize = GetFreeSize_Internal();
+
+        // 여유 공간 검증
+        if (freeSize < size)
+        {
+            _lock.unlock();
+            return 0;
+        }
+
+        _writePos = (_writePos + size) % _capacity;
 
         _lock.unlock();
         return size;
@@ -185,35 +240,96 @@ public:
         _lock.unlock();
     }
 
-    // NoLock(싱글스레드) 전용: 외부에서 크기 조회 가능
-    // MutexLock 버전에서는 SFINAE + static_assert 이중 차단
-    template<typename U = LockPolicy, std::enable_if_t<std::is_same_v<U, NoLock>, int> = 0>
     size_t GetDataSize() const
     {
-        static_assert(std::is_same_v<LockPolicy, NoLock>,
-            "GetDataSize()는 싱글스레드(NoLock) 버전 전용입니다. 멀티스레드에서는 IsEmpty()를 사용하세요.");
-        return GetDataSizeInternal();
+        _lock.lock();
+        size_t result = GetDataSize_Internal();
+        _lock.unlock();
+        return result;
     }
 
-    template<typename U = LockPolicy, std::enable_if_t<std::is_same_v<U, NoLock>, int> = 0>
     size_t GetFreeSize() const
     {
-        static_assert(std::is_same_v<LockPolicy, NoLock>,
-            "GetFreeSize()는 싱글스레드(NoLock) 버전 전용입니다. 멀티스레드에서는 IsEmpty()를 사용하세요.");
-        return GetFreeSizeInternal();
+        _lock.lock();
+        size_t result = GetFreeSize_Internal();
+        _lock.unlock();
+        return result;
     }
 
-    // 양쪽 버전에서 모두 사용 가능 (MT-safe)
-    bool IsEmpty() const
+    char* GetWritePtr()
     {
         _lock.lock();
-        bool empty = (GetDataSizeInternal() == 0);
+        char* ptr = _buffer + _writePos;
         _lock.unlock();
-        return empty;
+        return ptr;
     }
 
+    char* GetReadPtr()
+    {
+        _lock.lock();
+        char* ptr = _buffer + _readPos;
+        _lock.unlock();
+        return ptr;
+    }
+
+    size_t GetDirectWriteSize() const
+    {
+        _lock.lock();
+        size_t result;
+        if (_writePos >= _readPos)
+            result = (_readPos == 0) ? _capacity - _writePos - 1 : _capacity - _writePos;
+        else
+            result = _readPos - _writePos - 1;
+        _lock.unlock();
+        return result;
+    }
+
+    size_t GetDirectReadSize() const
+    {
+        _lock.lock();
+        size_t result;
+        if (_writePos >= _readPos)
+            result = _writePos - _readPos;
+        else
+            result = _capacity - _readPos;
+        _lock.unlock();
+        return result;
+    }
+
+    // 모든 함수는 lock으로 보호되지만, 여러개의 함수를 호출했을때
+    // 일관성이 보장되지는 않는다. 따라서 새로운 구조체 추가
+    struct SendInfo
+    {
+        char* readPtr;
+        size_t dataSize;
+        size_t directReadSize;
+    };
+
+    SendInfo GetSendInfo()
+    {
+        _lock.lock();
+        SendInfo info;
+        info.readPtr = _buffer + _readPos;
+        info.dataSize = GetDataSize_Internal();
+
+        if (_writePos >= _readPos)
+            info.directReadSize = _writePos - _readPos;
+        else
+            info.directReadSize = _capacity - _readPos;
+
+        _lock.unlock();
+        return info;
+    }
+
+public:
+    char* _buffer;
+    size_t _capacity;
+    size_t _readPos;
+    size_t _writePos;
+    mutable LockPolicy _lock;
+
 private:
-    size_t GetDataSizeInternal() const
+    size_t GetDataSize_Internal() const
     {
         if (_writePos >= _readPos)
             return _writePos - _readPos;
@@ -221,21 +337,18 @@ private:
             return _capacity - _readPos + _writePos;
     }
 
-    size_t GetFreeSizeInternal() const
+    size_t GetFreeSize_Internal() const
     {
-        size_t dataSize = GetDataSizeInternal();
+        size_t dataSize = GetDataSize_Internal();
         if (dataSize >= _capacity - 1)
             return 0;
         return _capacity - dataSize - 1;
     }
 
-    char* _buffer;
-    size_t _capacity;
-    size_t _readPos;
-    size_t _writePos;
-    mutable LockPolicy _lock;  // ← 템플릿 매개변수!
+    CRingBufferT(const CRingBufferT&) = delete;
+    CRingBufferT& operator=(const CRingBufferT&) = delete;
 };
 
 // === Type Aliases (사용 편의성) ===
 using CRingBufferST = CRingBufferT<NoLock>;       // 싱글스레드 버전
-using CRingBufferMT = CRingBufferT<MutexLock>;    // 멀티스레드 버전 (기본)
+using CRingBufferMT = CRingBufferT<MutexLock>;    // 멀티스레드 버전

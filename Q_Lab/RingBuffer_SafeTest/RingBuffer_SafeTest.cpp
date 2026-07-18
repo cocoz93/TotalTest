@@ -1,4 +1,4 @@
-//
+﻿//
 #include <iostream>
 #include <vector>
 #include <atomic>
@@ -10,6 +10,26 @@
 #include <memory> 
 #include <string>
 #include "RingBuffer.h"
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+// system("cls") 대체 — 프로세스 스폰 없이 콘솔 클리어 (경합 테스트 CPU 노이즈 제거)
+static void ClearScreen()
+{
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (!GetConsoleScreenBufferInfo(h, &csbi)) return;
+    DWORD cells = csbi.dwSize.X * csbi.dwSize.Y, written;
+    COORD home = { 0, 0 };
+    FillConsoleOutputCharacterA(h, ' ', cells, home, &written);
+    FillConsoleOutputAttribute(h, csbi.wAttributes, cells, home, &written);
+    SetConsoleCursorPosition(h, home);
+}
+#else
+#include <cstdlib>
+static void ClearScreen() { system("clear"); }
+#endif
 
 //=============================================================================
 // 테스트 설정 상수 (반복 횟수 조절 가능)
@@ -24,6 +44,10 @@ namespace TestConfig
     // Phase 2: 멀티스레드 테스트
 	const uint64_t NUMBERS_PER_THREAD = 10'000'000; // 각 생산자 스레드가 생성할 숫자 개수 (Producer-Consumer)
     const uint64_t HIGH_CONTENTION_OPS_PER_THREAD = 10'000'000; // 각 스레드당 작업 횟수 (고빈도 경합)
+
+    // Phase 3: Zero-copy 직접접근 (서버 실제 경로 — GetWritePtr/MoveWritePtr, GetSendInfo/GetReadPtr/Consume)
+    const uint64_t ZEROCOPY_ITERATIONS = 25'000'000;
+    const uint64_t ZEROCOPY_MT_BYTES = 100'000'000; // GetSendInfo MT 테스트 총 바이트
 
     // 진행 상황 출력 주기
     const uint64_t PROGRESS_INTERVAL = 10'000'000; // 설정된 값 마다 모니터링 출력
@@ -180,7 +204,8 @@ void Test_Invariants()
     std::cout << "========================================" << std::endl;
 
     const uint64_t ITERATIONS = TestConfig::INVARIANT_ITERATIONS;
-    auto container = std::make_unique<CRingBufferST>(4096);
+    const size_t CAPACITY = 4096;
+    auto container = std::make_unique<CRingBufferST>(CAPACITY);
     if (!container->IsValid())
     {
         std::cout << "[ERROR] RingBuffer 할당 실패" << std::endl;
@@ -202,7 +227,7 @@ void Test_Invariants()
 
         size_t beforeDataSize = container->GetDataSize();
         size_t beforeFreeSize = container->GetFreeSize();
-        size_t capacity = 4095;
+        size_t capacity = CAPACITY - 1;   // full/empty 구분용 1칸 예약 → 유효용량 = 실제-1
 
 		// [사용중인 공간 + 여유 공간 = 용량 - 1] 확인
         TEST_ASSERT(beforeDataSize + beforeFreeSize == capacity,
@@ -430,8 +455,12 @@ void RunProducerConsumerTest(
     }
 
     // dequeueCheck를 힙에 unique_ptr로 할당
-    auto dequeueCheck = std::make_unique<std::atomic<int>[]>(TOTAL_NUMBERS);
-    if (!dequeueCheck)
+    std::unique_ptr<std::atomic<int>[]> dequeueCheck;
+    try
+    {
+        dequeueCheck = std::make_unique<std::atomic<int>[]>(TOTAL_NUMBERS);
+    }
+    catch (const std::bad_alloc&)   // make_unique는 실패 시 예외를 던짐 (null 반환 아님)
     {
         std::cout << "[ERROR] dequeueCheck 메모리 할당 실패: " << TOTAL_NUMBERS << std::endl;
         return;
@@ -449,11 +478,7 @@ void RunProducerConsumerTest(
         {
             if (!pauseProgress) // 최종 검증 중엔 출력 안함
             {
-#ifdef _WIN32
-            system("cls");
-#else
-            system("clear");
-#endif
+            ClearScreen();
             std::cout << "========================================" << std::endl;
             std::cout << "[Phase 2-1] Producer-Consumer 테스트" << std::endl;  // ← 추가
             std::cout << "========================================" << std::endl;
@@ -464,6 +489,7 @@ void RunProducerConsumerTest(
             std::cout << runningLine << std::endl;
             double enqueueRate = (double)totalEnqueued / TOTAL_NUMBERS * 100.0;
             double dequeueRate = (double)totalDequeued / TOTAL_NUMBERS * 100.0;
+            g_totalIterations = totalDequeued.load();   // Phase 2 진행 반영 (크래시 시 stale 방지)
             std::cout << "[진행률] Enqueue: " << enqueueRate << "%, Dequeue: " << dequeueRate << "%\n";
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -615,7 +641,7 @@ void RunProducerConsumerTest(
     TEST_ASSERT(duplicateCount == 0, "중복 처리된 숫자 발견");
     std::cout << "  > 모든 숫자 정확히 1번씩 처리 완료" << std::endl;
 
-    TEST_ASSERT(container->IsEmpty(), "버퍼가 완전히 비워지지 않음");
+    TEST_ASSERT(container->GetDataSize() == 0, "버퍼가 완전히 비워지지 않음");
     std::cout << "  > 버퍼 완전히 비워짐" << std::endl;
 
     std::cout << "\n[PASS] Producer " << producerCount << " / Consumer " << consumerCount << " 완료 (소요: " << elapsed << "초)" << std::endl;
@@ -663,11 +689,7 @@ void Test_ProducerConsumer()
     }
 
     // 마지막 전체 완료 출력
-#ifdef _WIN32
-    system("cls");
-#else
-    system("clear");
-#endif
+    ClearScreen();
     std::cout << "========================================" << std::endl;
     for (size_t i = 0; i < completedLines.size(); ++i)
     {
@@ -694,17 +716,26 @@ struct ContentionPacket
     uint32_t sequence;
     uint32_t checksum;
 
+    // 순서 민감 혼합 해시 — XOR과 달리 필드 스왑/특정 비트패턴도 검출 (Knuth multiplicative)
+    static uint32_t Mix(uint32_t m, uint32_t t, uint32_t s)
+    {
+        uint32_t h = m;
+        h = h * 2654435761u + t;
+        h = h * 2654435761u + s;
+        return h;
+    }
+
     void Init(uint32_t tid, uint32_t seq)
     {
         magic = 0xDEADBEEF;
         threadId = tid;
         sequence = seq;
-        checksum = magic ^ threadId ^ sequence;
+        checksum = Mix(magic, threadId, sequence);
     }
 
     bool Verify() const
     {
-        return magic == 0xDEADBEEF && checksum == (magic ^ threadId ^ sequence);
+        return magic == 0xDEADBEEF && checksum == Mix(magic, threadId, sequence);
     }
 };
 static_assert(sizeof(ContentionPacket) == 16, "ContentionPacket must be 16 bytes");
@@ -729,11 +760,7 @@ void RunHighContentionTest(
         {
             if (!pauseProgress)
             {
-#ifdef _WIN32
-                system("cls");
-#else
-                system("clear");
-#endif
+                ClearScreen();
                 std::cout << "========================================" << std::endl;
                 std::cout << "[Phase 2-2] 고빈도 경합 + 무결성 테스트" << std::endl;
                 std::cout << "========================================" << std::endl;
@@ -745,6 +772,7 @@ void RunHighContentionTest(
                 
                 uint64_t total = opsPerThread * threadCount;
                 uint64_t current = totalAttempts.load();
+                g_totalIterations = current;   // Phase 2 진행 반영 (크래시 시 stale 방지)
                 double progress = (double)current / total * 100.0;
                 
                 std::cout << "[진행률] " << current << " / " << total 
@@ -823,7 +851,7 @@ void RunHighContentionTest(
     uint64_t finalDeq = dequeueCount.load();
 
     TEST_ASSERT(finalDeq == finalEnq, "Enqueue/Dequeue 개수 불일치");
-    TEST_ASSERT(container->IsEmpty(), "버퍼가 완전히 비워지지 않음");
+    TEST_ASSERT(container->GetDataSize() == 0, "버퍼가 완전히 비워지지 않음");
 
     std::cout << "  > Enqueue 성공: " << finalEnq << " 패킷" << std::endl;
     std::cout << "  > Dequeue 성공: " << finalDeq << " 패킷 (잔여 회수: " << drainCount << ")" << std::endl;
@@ -881,11 +909,7 @@ void Test_HighContentionFalseSharing()
     }
 
     // 마지막 전체 완료 출력
-#ifdef _WIN32
-    system("cls");
-#else
-    system("clear");
-#endif
+    ClearScreen();
     std::cout << "========================================" << std::endl;
     for (size_t i = 0; i < completedLines.size(); ++i)
     {
@@ -936,6 +960,247 @@ void Test_InvalidUsageDefense()
 }
 
 //=============================================================================
+// Phase 3-1: Zero-copy 직접접근 왕복 (단일 스레드)
+// 서버 실제 경로 모사 — 수신: GetWritePtr+GetDirectWriteSize+MoveWritePtr,
+//                       송신: GetReadPtr+GetDirectReadSize+Consume.
+// 복사(Enqueue/Dequeue) 대신 포인터로 직접 쓰고 읽어 순서·손상·랩 검증.
+//=============================================================================
+void Test_ZeroCopyRoundtrip()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 3-1] Zero-copy 직접접근 왕복 테스트" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    const uint64_t ITERATIONS = TestConfig::ZEROCOPY_ITERATIONS;
+    auto container = std::make_unique<CRingBufferST>(4096);
+    if (!container->IsValid())
+    {
+        std::cout << "[ERROR] RingBuffer 할당 실패" << std::endl;
+        return;
+    }
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    uint8_t writeByte = 0;   // 쓴 바이트 순번 (FIFO 무결성 검증용, 256 순환)
+    uint8_t readByte = 0;    // 읽은 바이트 순번
+    uint64_t writeTotal = 0, readTotal = 0;
+    auto startTime = std::chrono::steady_clock::now();
+
+    for (uint64_t i = 0; i < ITERATIONS; i++)
+    {
+        g_totalIterations = i;
+        PrintProgress("Zero-copy 왕복", i, ITERATIONS);
+
+        // --- 수신 모사: GetWritePtr에 직접 써넣기 (WSARecv 경로) ---
+        size_t wspace = container->GetDirectWriteSize();   // 연속 쓰기 가능 크기 (버퍼 끝에서 잘림)
+        if (wspace > 0)
+        {
+            size_t toWrite = (gen() % wspace) + 1;         // 1~wspace (연속 범위 내)
+            char* wp = container->GetWritePtr();
+            for (size_t k = 0; k < toWrite; k++)
+                wp[k] = static_cast<char>(writeByte++);
+            size_t moved = container->MoveWritePtr(toWrite);
+            TEST_ASSERT(moved == toWrite, "MoveWritePtr 크기 불일치");
+            writeTotal += toWrite;
+        }
+
+        // --- 송신 모사: GetReadPtr에서 직접 읽기 (WSASend 경로) ---
+        size_t rsize = container->GetDirectReadSize();     // 연속 읽기 가능 크기
+        if (rsize > 0)
+        {
+            size_t toRead = (gen() % rsize) + 1;
+            const char* rp = container->GetReadPtr();
+            for (size_t k = 0; k < toRead; k++)
+            {
+                TEST_ASSERT(static_cast<uint8_t>(rp[k]) == readByte, "직접읽기 데이터 손상: 순번 불일치");
+                readByte++;
+            }
+            size_t consumed = container->Consume(toRead);
+            TEST_ASSERT(consumed == toRead, "Consume 크기 불일치");
+            readTotal += toRead;
+        }
+    }
+
+    // 남은 데이터 직접읽기로 모두 회수 + 검증
+    while (container->GetDirectReadSize() > 0)
+    {
+        size_t rsize = container->GetDirectReadSize();
+        const char* rp = container->GetReadPtr();
+        for (size_t k = 0; k < rsize; k++)
+        {
+            TEST_ASSERT(static_cast<uint8_t>(rp[k]) == readByte, "최종 직접읽기 손상");
+            readByte++;
+        }
+        container->Consume(rsize);
+        readTotal += rsize;
+    }
+
+    TEST_ASSERT(readTotal == writeTotal, "직접 쓴/읽은 총 바이트 불일치");
+    TEST_ASSERT(container->GetDataSize() == 0, "버퍼가 완전히 비워지지 않음");
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - startTime).count();
+    std::cout << "\n[PASS] Zero-copy 왕복 완료! (총 " << writeTotal
+        << " 바이트, 소요: " << elapsed << "초)" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
+// Phase 3-2: Zero-copy 경계 랩 집중 (단일 스레드)
+// readPos=writePos를 버퍼 끝 근처로 몰아, GetDirectWriteSize가 잘리는 지점에서
+// 2단계 랩(끝까지 쓰고 → 커서 넘겨 → 처음부터)을 매 반복 강제 검증. (포인터 산술 버그 정조준)
+//=============================================================================
+void Test_ZeroCopyBoundary()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 3-2] Zero-copy 경계 랩 집중 테스트" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    const uint64_t ITERATIONS = TestConfig::ZEROCOPY_ITERATIONS;
+    const size_t CAP = 256;
+    auto container = std::make_unique<CRingBufferST>(CAP);
+
+    // 포인터를 끝 근처(CAP-4)로 이동 → 이후 직접쓰기는 매번 경계에서 쪼개짐
+    std::vector<char> setup(CAP - 4);
+    container->Enqueue(setup.data(), setup.size());
+    container->Dequeue(setup.data(), setup.size());
+    TEST_ASSERT(container->GetDataSize() == 0, "Setup: 버퍼가 비워지지 않음");
+
+    uint8_t wb = 0, rb = 0;
+    uint64_t total = 0;
+    auto startTime = std::chrono::steady_clock::now();
+
+    for (uint64_t i = 0; i < ITERATIONS; i++)
+    {
+        g_totalIterations = i;
+        PrintProgress("경계 랩(직접접근)", i, ITERATIONS);
+
+        // (CAP-8) 바이트를 직접쓰기 — GetDirectWriteSize만큼씩 → 경계에서 2단계로 분할됨
+        size_t remain = CAP - 8;
+        while (remain > 0)
+        {
+            size_t wspace = container->GetDirectWriteSize();
+            TEST_ASSERT(wspace > 0, "경계: 쓸 연속공간 0 (진행 불가)");
+            size_t chunk = (remain < wspace) ? remain : wspace;
+            char* wp = container->GetWritePtr();
+            for (size_t k = 0; k < chunk; k++)
+                wp[k] = static_cast<char>(wb++);
+            container->MoveWritePtr(chunk);
+            remain -= chunk;
+        }
+
+        // 직접읽기로 다 회수 + 순번 검증
+        size_t toRead = CAP - 8;
+        while (toRead > 0)
+        {
+            size_t rsize = container->GetDirectReadSize();
+            TEST_ASSERT(rsize > 0, "경계: 읽을 연속데이터 0 (진행 불가)");
+            size_t chunk = (toRead < rsize) ? toRead : rsize;
+            const char* rp = container->GetReadPtr();
+            for (size_t k = 0; k < chunk; k++)
+            {
+                TEST_ASSERT(static_cast<uint8_t>(rp[k]) == rb, "경계 직접읽기 손상");
+                rb++;
+            }
+            container->Consume(chunk);
+            toRead -= chunk;
+        }
+
+        TEST_ASSERT(container->GetDataSize() == 0, "경계 작업 후 안 비워짐");
+        total += CAP - 8;
+    }
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - startTime).count();
+    std::cout << "\n[PASS] 경계 랩 집중 완료! (총 " << total << " 바이트, 소요: " << elapsed << "초)" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
+// Phase 3-3: GetSendInfo 스냅샷 정합성 (멀티스레드)
+// 서버 송신 경로 정밀 모사 — 소비자(단일)가 GetSendInfo로 {readPtr,size} 스냅샷을 받아
+// 그만큼 직접 읽는 동안, 생산자가 동시에 Enqueue. 스냅샷이 유효한지(손상/torn 없는지) 검증.
+// → 링버퍼의 '// TODO: 결함수준 재확인'(getter 다중호출 일관성)을 실측으로 판정.
+//=============================================================================
+void Test_ZeroCopySendInfoMT()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 3-3] GetSendInfo 정합성 테스트 (MT)" << std::endl;
+    std::cout << "  목표: " << TestConfig::ZEROCOPY_MT_BYTES / 1'000'000 << "백만 바이트 (생산자 N + 소비자 1)" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    const uint64_t TARGET = TestConfig::ZEROCOPY_MT_BYTES;
+    auto container = std::make_unique<CRingBufferMT>(4096);
+    if (!container->IsValid())
+    {
+        std::cout << "[ERROR] RingBuffer 할당 실패" << std::endl;
+        return;
+    }
+
+    std::atomic<bool> producerDone(false);
+    std::atomic<uint64_t> enqTotal(0), deqTotal(0);
+    auto startTime = std::chrono::steady_clock::now();
+
+    // 생산자(단일): 바이트 순번(FIFO)으로 Enqueue — 소비자가 순번으로 무결성 검증 가능
+    std::thread producer([&]()
+    {
+        std::random_device rd; std::mt19937 gen(rd());
+        uint8_t wb = 0;
+        uint64_t sent = 0;
+        std::vector<char> chunk;
+        while (sent < TARGET)
+        {
+            size_t n = (gen() % 256) + 1;
+            if (n > TARGET - sent) n = static_cast<size_t>(TARGET - sent);
+            chunk.resize(n);
+            for (size_t k = 0; k < n; k++) chunk[k] = static_cast<char>(wb++);
+            while (container->Enqueue(chunk.data(), n) != n) { /* 버퍼 full: 소비자가 뺄 때까지 재시도 */ }
+            sent += n;
+            enqTotal += n;
+        }
+        producerDone = true;
+    });
+
+    // 소비자(단일): GetSendInfo 스냅샷 → readPtr에서 직접읽기 → 순번 검증 → Consume
+    std::thread consumer([&]()
+    {
+        uint8_t rb = 0;
+        while (true)
+        {
+            auto info = container->GetSendInfo();   // {readPtr, dataSize, directReadSize} 원자 스냅샷
+            if (info.directReadSize == 0)
+            {
+                if (producerDone && container->GetDataSize() == 0) break;
+                continue;   // 아직 데이터 없음 (또는 생산 중)
+            }
+            for (size_t k = 0; k < info.directReadSize; k++)
+            {
+                TEST_ASSERT(static_cast<uint8_t>(info.readPtr[k]) == rb,
+                    "GetSendInfo 직접읽기 데이터 손상: 순번 불일치");
+                rb++;
+            }
+            size_t consumed = container->Consume(info.directReadSize);
+            TEST_ASSERT(consumed == info.directReadSize, "Consume 크기 불일치");
+            deqTotal += info.directReadSize;
+        }
+    });
+
+    producer.join();
+    consumer.join();
+
+    TEST_ASSERT(enqTotal == TARGET, "생산 총량 불일치");
+    TEST_ASSERT(deqTotal == enqTotal, "소비 총량 불일치 (누락/중복)");
+    TEST_ASSERT(container->GetDataSize() == 0, "버퍼가 완전히 비워지지 않음");
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - startTime).count();
+    std::cout << "\n[PASS] GetSendInfo 정합성 완료! (" << deqTotal << " 바이트, 소요: "
+        << elapsed / 1000.0 << "초)" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
 // 메뉴 출력
 //=============================================================================
 void PrintMenu()
@@ -953,8 +1218,13 @@ void PrintMenu()
     std::cout << "  6. Producer-Consumer 테스트 (1억 바이트)" << std::endl;
     std::cout << "  7. 고빈도 경합 테스트" << std::endl;
     std::cout << "  8. Phase 2 전체 실행" << std::endl;
+    std::cout << "\n[Phase 3: Zero-copy 직접접근 - 서버 실제 경로]" << std::endl;
+    std::cout << " 10. 직접접근 왕복 테스트" << std::endl;
+    std::cout << " 11. 경계 랩 집중 테스트" << std::endl;
+    std::cout << " 12. GetSendInfo 정합성 테스트 (MT)" << std::endl;
+    std::cout << " 13. Phase 3 전체 실행" << std::endl;
     std::cout << "\n[전체]" << std::endl;
-    std::cout << "  9. 전체 테스트 실행 (Phase 1 + Phase 2)" << std::endl;
+    std::cout << "  9. 전체 테스트 실행 (Phase 1 + 2 + 3)" << std::endl;
     std::cout << "  0. 종료" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "선택: ";
@@ -1028,6 +1298,24 @@ int main()
                 Test_InvalidUsageDefense();
                 Test_ProducerConsumer();
                 Test_HighContentionFalseSharing();
+                Test_ZeroCopyRoundtrip();
+                Test_ZeroCopyBoundary();
+                Test_ZeroCopySendInfoMT();
+                break;
+            case 10:
+                Test_ZeroCopyRoundtrip();
+                break;
+            case 11:
+                Test_ZeroCopyBoundary();
+                break;
+            case 12:
+                Test_ZeroCopySendInfoMT();
+                break;
+            case 13:
+                std::cout << "\n[Phase 3 전체 실행]" << std::endl;
+                Test_ZeroCopyRoundtrip();
+                Test_ZeroCopyBoundary();
+                Test_ZeroCopySendInfoMT();
                 break;
             default:
                 std::cout << "\n잘못된 선택입니다." << std::endl;
@@ -1049,7 +1337,7 @@ int main()
         std::cout << "  - 완료된 테스트: " << g_testCount << " 개" << std::endl;
         std::cout << "  - 총 소요 시간: " << totalElapsed << " 초 ("
             << totalElapsed / 60 << " 분)" << std::endl;
-        std::cout << "  - 결과: ✓ 100% PASS" << std::endl;
+        std::cout << "  - 결과: [OK] 100% PASS" << std::endl;
         std::cout << "========================================" << std::endl;
     }
 
