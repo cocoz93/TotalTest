@@ -83,15 +83,25 @@ public:
         return true;
     }
 
-    // 외부 소유 버퍼로 초기화 — 비소유(소멸 시 delete 안 함). 1회 초기화 전용 (Init와 동일 계약).
+    // 외부 소유 버퍼로 초기화 — 비소유(소멸 시 delete 안 함).
     //   RIO 등록 슬랩처럼 링버퍼보다 수명이 긴 메모리의 슬라이스를 링으로 쓸 때 사용.
     bool InitExternal(char* buffer, size_t capacity)
     {
         if (buffer == nullptr || capacity == 0)
             return false;
 
+        // 재호출 방어 — Init와 동일 계약. 이전에 "소유하던" 버퍼가 있으면 해제한다.
+        //   빌린 버퍼(_ownsBuffer=false)는 남의 것이라 절대 건드리지 않는다.
+        //   현 호출부(Transport_Rio.cpp:73)는 Init와 배타적이라 해제할 것이 없지만,
+        //   호출 규약에만 기대지 않도록 헤더에서 막아 둔다.
+        if (_buffer != nullptr && _ownsBuffer)
+            delete[] _buffer;
+
         _buffer = buffer;
         _capacity = capacity;
+        _readPos = 0;
+        _writePos = 0;
+        _submitPos = 0;
         _ownsBuffer = false;
         return true;
     }
