@@ -7,6 +7,7 @@
 #include <cstring>
 #include <thread>
 #include <string>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <condition_variable>
@@ -82,6 +83,10 @@ namespace TestConfig
     // Phase 5: 원본 ↔ 수정본 동등성
     const uint64_t EQUIVALENCE_ROUNDS = 2'000'000;          // 동등성 비교 라운드
 
+    // Phase 6: 성능 계측
+    const uint64_t PERF_ADDREF_ROUNDS = 2'000'000;          // AddRef 방식 비교 라운드
+    const uint64_t PERF_PACKET_ROUNDS = 5'000'000;          // 구조체 대비 직렬화 라운드
+
     // 진행 상황 출력 주기
     const uint64_t PROGRESS_INTERVAL = 500'000;
 }
@@ -90,6 +95,7 @@ namespace TestConfig
 std::atomic<uint64_t> g_testCount(0);
 std::atomic<uint64_t> g_totalIterations(0);
 std::atomic<uint64_t> g_warnCount(0);
+double g_perfStructNs = 1.0;   // 6-2 비교 기준
 
 // 크래시 함수
 void Crash()
@@ -2145,6 +2151,195 @@ void Test_Equivalence()
 }
 
 //=============================================================================
+// Phase 6: 성능 계측
+//
+// 숫자 하나만으로는 판단이 안 되므로 항상 비교 대상과 같이 잰다.
+//   6-1  배치 AddRef(N) vs 단건 AddRef()×N   — 실제로 넣은 최적화의 효과
+//   6-2  구조체 memcpy vs 직렬화 연산자       — 직렬화 추상화의 비용(하한선 참조)
+//
+// 주의
+//   · 리눅스 g++ 수치다. 절대값은 MSVC/Windows 로 옮겨가지 않는다.
+//     같은 빌드 안에서의 상대 비교만 유효하다.
+//   · 컴파일러가 측정 대상을 통째로 지워버리지 않도록 volatile 입력과
+//     실제로 쓰이는 누적값(sink)으로 막았다.
+//=============================================================================
+
+// 6-2 비교군: 같은 논리 패킷을 담는 1바이트 정렬 구조체
+#pragma pack(push, 1)
+struct PerfPacket
+{
+    int64_t  accountNo;
+    float    posX;
+    float    posY;
+    int32_t  hp;
+    uint16_t direction;
+};
+#pragma pack(pop)
+
+void Test_Performance()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 6] 성능 계측 시작" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    //-------------------------------------------------------------------------
+    // 6-1. 배치 AddRef(N) vs 단건 AddRef()×N
+    //
+    // 실제 코드(BroadcastAroundSector)는 유효 타겟 수를 선카운트해서
+    // AddRef(validCount) 를 1회 부른다. 타겟별로 AddRef() 를 N번 부르는 것과
+    // 결과는 같고, 원자연산 횟수가 N → 1 로 준다. 그 차이를 잰다.
+    //-------------------------------------------------------------------------
+    std::cout << "\n[6-1] 배치 AddRef(N) vs 단건 AddRef()×N" << std::endl;
+    std::cout << "  라운드: " << TestConfig::PERF_ADDREF_ROUNDS << " (타겟 수별)" << std::endl;
+    std::cout << "  ┌────────┬──────────────┬──────────────┬─────────┐" << std::endl;
+    std::cout << "  │ 타겟수 │  배치 (ns)   │  단건 (ns)   │  절감   │" << std::endl;
+    std::cout << "  ├────────┼──────────────┼──────────────┼─────────┤" << std::endl;
+
+    const int targetCounts[] = { 2, 4, 8, 16, 64 };
+    for (int targets : targetCounts)
+    {
+        // 힙 객체로 잰다 — 스택 객체에 SubRef 를 쓰면 카운트가 0 이 되는 순간
+        // Free 가 스택 메모리에 delete 를 걸게 된다 (LTO 빌드가 이 위험을 경고했다).
+        UTBuffer* msg = UTBuffer::Alloc();
+        UTBuffer& buffer = *msg;
+        volatile int64_t vTargets = targets;
+
+        // --- 배치 ---
+        buffer._RefCount.store(1);
+        auto t0 = std::chrono::steady_clock::now();
+        for (uint64_t r = 0; r < TestConfig::PERF_ADDREF_ROUNDS; ++r)
+        {
+            const int64_t n = vTargets;
+            buffer.AddRef(n);                       // 원자연산 1회
+            for (int64_t t = 0; t < n; ++t)
+                buffer.SubRef();                    // 소비는 양쪽 동일
+        }
+        auto batchNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        TEST_ASSERT(buffer._RefCount.load() == 1, "배치 측정 후 RefCount 불일치");
+
+        // --- 단건 ---
+        buffer._RefCount.store(1);
+        t0 = std::chrono::steady_clock::now();
+        for (uint64_t r = 0; r < TestConfig::PERF_ADDREF_ROUNDS; ++r)
+        {
+            const int64_t n = vTargets;
+            for (int64_t t = 0; t < n; ++t)
+                buffer.AddRef();                    // 원자연산 N회
+            for (int64_t t = 0; t < n; ++t)
+                buffer.SubRef();
+        }
+        auto singleNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        TEST_ASSERT(buffer._RefCount.load() == 1, "단건 측정 후 RefCount 불일치");
+
+        const double batchPer = (double)batchNs / TestConfig::PERF_ADDREF_ROUNDS;
+        const double singlePer = (double)singleNs / TestConfig::PERF_ADDREF_ROUNDS;
+        const double saved = (singlePer - batchPer) / singlePer * 100.0;
+
+        std::cout << "  │  " << (targets < 10 ? " " : "") << targets << (targets < 10 ? "    " : "   ")
+            << " │ " << std::fixed << std::setprecision(1)
+            << (batchPer < 100 ? " " : "") << (batchPer < 10 ? " " : "") << batchPer << "        │ "
+            << (singlePer < 100 ? " " : "") << (singlePer < 10 ? " " : "") << singlePer << "        │ "
+            << std::setprecision(1) << (saved < 10 ? " " : "") << saved << "%   │" << std::endl;
+
+        msg->SubRef();   // RefCount 1 → 0, 프리리스트로 회수
+    }
+    std::cout << "  └────────┴──────────────┴──────────────┴─────────┘" << std::endl;
+    std::cout << "  ※ 라운드당 시간이며, 소비(SubRef×N)는 양쪽 동일하게 포함돼 있다." << std::endl;
+    std::cout << "     따라서 절감률은 AddRef 부분만 놓고 보면 더 크다." << std::endl;
+
+    //-------------------------------------------------------------------------
+    // 6-2. 구조체 memcpy vs 직렬화 연산자
+    //
+    // 구조체 방식은 진짜 대안이 아니다 — 패딩·정렬에 묶이고, 가변 길이를 못 담고,
+    // 다른 언어/플랫폼과 레이아웃이 안 맞는다. 여기서는 "직렬화 추상화가
+    // 얼마를 쓰는가"를 보기 위한 하한선 참조로만 쓴다.
+    //-------------------------------------------------------------------------
+    std::cout << "\n[6-2] 구조체 memcpy vs 직렬화 연산자" << std::endl;
+    std::cout << "  라운드: " << TestConfig::PERF_PACKET_ROUNDS << std::endl;
+
+    volatile int64_t  srcAccountNo = 0x1122334455667788LL;
+    volatile float    srcPosX = 1234.5f;
+    volatile float    srcPosY = -99.25f;
+    volatile int32_t  srcHp = 4321;
+    volatile uint16_t srcDirection = 3;
+
+    uint64_t sink = 0;
+
+    // --- (a) 구조체 memcpy 왕복 ---
+    {
+        char raw[64];
+        auto t0 = std::chrono::steady_clock::now();
+        for (uint64_t r = 0; r < TestConfig::PERF_PACKET_ROUNDS; ++r)
+        {
+            PerfPacket out;
+            out.accountNo = srcAccountNo + (int64_t)r;
+            out.posX = srcPosX;
+            out.posY = srcPosY;
+            out.hp = srcHp;
+            out.direction = srcDirection;
+            std::memcpy(raw, &out, sizeof(out));
+
+            PerfPacket in;
+            std::memcpy(&in, raw, sizeof(in));
+            sink += (uint64_t)in.accountNo + (uint64_t)in.hp + in.direction;
+        }
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::cout << "  구조체 memcpy 왕복  : " << std::fixed << std::setprecision(2)
+            << (double)ns / TestConfig::PERF_PACKET_ROUNDS << " ns  ("
+            << sizeof(PerfPacket) << " 바이트)" << std::endl;
+        g_perfStructNs = (double)ns / TestConfig::PERF_PACKET_ROUNDS;
+    }
+
+    // --- (b) 직렬화 연산자 왕복 ---
+    {
+        UTBuffer buffer(MSG_DEFAULT_SIZE);
+        auto t0 = std::chrono::steady_clock::now();
+        for (uint64_t r = 0; r < TestConfig::PERF_PACKET_ROUNDS; ++r)
+        {
+            buffer.Clear();
+            buffer << (int64_t)(srcAccountNo + (int64_t)r)
+                << (float)srcPosX << (float)srcPosY
+                << (int32_t)srcHp << (uint16_t)srcDirection;
+
+            int64_t  accountNo = 0;
+            float    posX = 0.0f, posY = 0.0f;
+            int32_t  hp = 0;
+            uint16_t direction = 0;
+            buffer >> accountNo >> posX >> posY >> hp >> direction;
+            sink += (uint64_t)accountNo + (uint64_t)hp + direction;
+        }
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        const double per = (double)ns / TestConfig::PERF_PACKET_ROUNDS;
+        std::cout << "  직렬화 연산자 왕복  : " << std::fixed << std::setprecision(2)
+            << per << " ns" << std::endl;
+        std::cout << "  배수                : " << std::setprecision(2)
+            << per / g_perfStructNs << " 배" << std::endl;
+    }
+
+    TEST_ASSERT(sink != 0, "측정 결과가 사용되지 않음 — 최적화로 제거됐을 수 있음");
+
+    std::cout << "\n  ※ 이 배수는 링크 시 최적화(LTO) 여부에 크게 좌우된다." << std::endl;
+    std::cout << "     직렬화 연산자가 별도 번역 단위에 있어, LTO 가 없으면 필드마다" << std::endl;
+    std::cout << "     실제 함수 호출이 일어난다. 리눅스 g++ 측정 기준" << std::endl;
+    std::cout << "       -O2        : 왕복 약 30 ns (33 배)" << std::endl;
+    std::cout << "       -O2 -flto  : 왕복 약 14 ns (16 배)  ← 절반" << std::endl;
+    std::cout << "     MSVC Release 는 WholeProgramOptimization(/GL /LTCG)이 켜져 있으므로" << std::endl;
+    std::cout << "     실제 서버 빌드는 LTO 쪽 수치에 가깝다." << std::endl;
+
+    std::cout << "\n  ※ 구조체 방식은 대안이 아니라 하한선 참조다." << std::endl;
+    std::cout << "     패딩·정렬에 묶이고, 가변 길이 문자열을 못 담고," << std::endl;
+    std::cout << "     다른 언어·플랫폼과 레이아웃이 맞지 않는다." << std::endl;
+    std::cout << "     이 배수는 '직렬화 추상화가 얼마를 쓰는가'로만 읽을 것." << std::endl;
+
+    std::cout << "\n[PASS] 성능 계측 완료!" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
 // 메뉴 출력
 //=============================================================================
 void PrintMenu()
@@ -2175,8 +2370,10 @@ void PrintMenu()
     std::cout << " 17. 알려진 위험 지점 점검" << std::endl;
     std::cout << "\n[Phase 5: 원본 ↔ 수정본 동등성]" << std::endl;
     std::cout << " 19. 동등성 / 와이어 호환 테스트" << std::endl;
+    std::cout << "\n[Phase 6: 성능 계측]" << std::endl;
+    std::cout << " 21. 성능 계측 (배치 AddRef / 구조체 대비)" << std::endl;
     std::cout << "\n[전체]" << std::endl;
-    std::cout << " 20. 전체 실행 (Phase 1 ~ 5)" << std::endl;
+    std::cout << " 22. 전체 실행 (Phase 1 ~ 6)" << std::endl;
     std::cout << "  0. 종료" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "선택: ";
@@ -2261,7 +2458,8 @@ int main()
                 break;
             case 17: Test_KnownHazards(); break;
             case 19: Test_Equivalence(); break;
-            case 20:
+            case 21: Test_Performance(); break;
+            case 22:
                 std::cout << "\n[전체 테스트 실행]" << std::endl;
                 Test_BasicTypes();
                 Test_RandomMixed();
@@ -2278,6 +2476,7 @@ int main()
                 Test_MixedAddRef();
                 Test_KnownHazards();
                 Test_Equivalence();
+                Test_Performance();
                 break;
             default:
                 std::cout << "\n잘못된 선택입니다." << std::endl;
