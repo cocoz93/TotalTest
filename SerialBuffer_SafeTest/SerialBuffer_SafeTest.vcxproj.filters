@@ -1,0 +1,41 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="소스 파일">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="헤더 파일">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="테스트 대상(원본 사본)">
+      <UniqueIdentifier>{8A1E1B0C-4C2E-4A6D-9E77-2C7C1E5B9A31}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="테스트용 대체 헤더">
+      <UniqueIdentifier>{D3F4A2B1-7E58-4B0A-9C21-6F0D8E4A7C52}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="SerialBuffer_SafeTest.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="SerialBuffer.cpp">
+      <Filter>테스트 대상(원본 사본)</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="SerialBuffer.h">
+      <Filter>테스트 대상(원본 사본)</Filter>
+    </ClInclude>
+    <ClInclude Include="LockFreeConfig.h">
+      <Filter>테스트용 대체 헤더</Filter>
+    </ClInclude>
+    <ClInclude Include="Platform\Platform.h">
+      <Filter>테스트용 대체 헤더</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="README.md" />
+  </ItemGroup>
+</Project>
