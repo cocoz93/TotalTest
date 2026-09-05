@@ -42,6 +42,8 @@ namespace TestConfig
     const uint64_t RANDOM_MIXED_ROUNDS = 3'000'000;         // 랜덤 혼합 타입 라운드
     const uint64_t STRING_ITERATIONS = 1'000'000;           // 문자열 왕복
 
+    const uint64_t RECV_PATH_PACKETS = 2'000'000;           // recv 경로 통합 패킷 수
+
     // Phase 2: 수명 / 봉인
     const uint64_t LIFECYCLE_CYCLES = 1'000'000;            // Alloc→SubRef 사이클
     const int64_t  BATCH_ADDREF_TARGETS = 1'000;            // 배치 AddRef 타겟 수
@@ -505,6 +507,257 @@ void Test_Boundary()
     std::cout << "  [OK] 헤더 2바이트 예약 영역 분리" << std::endl;
 
     std::cout << "\n[PASS] 경계 조건 테스트 완료!" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
+// Phase 1-5: 잘못된 인자 방어 (C2)
+//
+// size=0 과 음수 크기를 각 API 에 넘겼을 때 어떻게 되는지 본다.
+//
+// 주의: SetData/GetData 에 음수 크기나 nullptr 을 넘기는 경로는 실행하지 않는다.
+//   둘 다 memcpy_s 까지 내려가는데, MSVC 의 memcpy_s 는 잘못된 인자에서
+//   invalid parameter handler 를 부르고 기본 설정이면 프로세스를 죽인다.
+//   즉 "테스트가 서버를 죽이는" 형태가 되므로 Phase 4 에서 계산으로만 확인한다.
+//=============================================================================
+void Test_InvalidArguments()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 1-5] 잘못된 인자 방어 테스트 시작" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    // --- 1. size = 0 은 무해해야 한다 ---
+    {
+        CSerialBuffer buffer(128);
+        int payload = 0x11223344;
+        buffer << payload;
+
+        const int dataBefore = buffer.GetDataSize();
+        char scratch[8];
+
+        TEST_ASSERT(buffer.SetData((char*)&payload, 0) == 0, "size=0 SetData 가 0 이외를 반환");
+        TEST_ASSERT(buffer.GetData(scratch, 0) == 0, "size=0 GetData 가 0 이외를 반환");
+        TEST_ASSERT(buffer.PeekData(scratch, 0) == 0, "size=0 PeekData 가 0 이외를 반환");
+        TEST_ASSERT(buffer.MoveWritePos(0) == 0, "size=0 MoveWritePos 가 0 이외를 반환");
+        TEST_ASSERT(buffer.MoveReadPos(0) == 0, "size=0 MoveReadPos 가 0 이외를 반환");
+        TEST_ASSERT(buffer.GetDataSize() == dataBefore, "size=0 호출이 버퍼 상태를 변경함");
+
+        int readBack = 0;
+        buffer >> readBack;
+        TEST_ASSERT(readBack == payload, "size=0 호출 이후 데이터가 손상됨");
+    }
+    std::cout << "  [OK] size=0 은 상태를 바꾸지 않고 0 을 반환" << std::endl;
+
+    // --- 2. MoveWritePos 에 음수 ---
+    //   IsFull(-1) 이 false 라 가드를 통과하고 _rear 가 뒤로 밀린다.
+    //   상태가 오염되므로 이 버퍼는 이 블록 밖에서 쓰지 않는다.
+    {
+        CSerialBuffer buffer(128);
+        TEST_ASSERT(buffer.GetDataSize() == 0, "초기 상태 불일치");
+
+        const int moved = buffer.MoveWritePos(-1);
+        const int dataSize = buffer.GetDataSize();
+
+        std::cout << "  MoveWritePos(-1) 반환값                 : " << moved << std::endl;
+        std::cout << "  그 뒤 GetDataSize()                     : " << dataSize << std::endl;
+
+        TEST_ASSERT(moved != 0 || dataSize == 0,
+            "음수 이동이 거부되지도, 상태를 바꾸지도 않는 모순 상태");
+        // 이 버퍼는 여기서 버린다 (쓰기 위치가 페이로드 앞쪽으로 넘어간 상태)
+    }
+
+    // --- 3. MoveReadPos 에 음수 ---
+    //   _front + size > _rear 비교가 음수에서 성립하지 않아 else 분기로 빠지고,
+    //   _DataSize -= (음수) 가 되어 없던 데이터가 생긴다.
+    {
+        CSerialBuffer buffer(128);
+        const int moved = buffer.MoveReadPos(-1);
+        const int dataSize = buffer.GetDataSize();
+
+        std::cout << "  MoveReadPos(-1) 반환값                  : " << moved << std::endl;
+        std::cout << "  그 뒤 GetDataSize()                     : " << dataSize << std::endl;
+
+        TEST_ASSERT(moved != 0 || dataSize == 0,
+            "음수 이동이 거부되지도, 상태를 바꾸지도 않는 모순 상태");
+    }
+    std::cout << "  [OK] 음수 이동의 실제 동작 기록 (Phase 4 에서 위험도 평가)" << std::endl;
+
+    // --- 4. IsEmpty / IsFull 의 0 과 음수 ---
+    {
+        CSerialBuffer buffer(128);
+        buffer << (int)0;
+
+        TEST_ASSERT(buffer.IsEmpty(0) == false, "IsEmpty(0) 이 true");
+        TEST_ASSERT(buffer.IsFull(0) == false, "빈 버퍼에서 IsFull(0) 이 true");
+        TEST_ASSERT(buffer.IsEmpty(-1) == false, "IsEmpty(-1) 이 true");
+    }
+    std::cout << "  [OK] IsEmpty/IsFull 의 0·음수 입력 동작 기록" << std::endl;
+
+    std::cout << "\n[PASS] 잘못된 인자 방어 테스트 완료!" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
+// Phase 1-6: recv 경로 통합 (C3)
+//
+// CIOCPServer::ParsePackets 를 그대로 모사한다:
+//   1) 링버퍼에 헤더 크기만큼 있는지 확인
+//   2) 첫 2바이트(size) peek
+//   3) 전체 패킷 크기 계산 및 검증 (headerSize ≤ total ≤ MAX_PACKET_SIZE)
+//   4) 전체가 도착했는지 확인 (부족하면 다음 recv 대기 — 부분 수신)
+//   5) Alloc → GetWriteBufferPtr() 에 직접 적재 → MoveWritePos
+//   6) 컨텐츠가 operator>> 로 헤더와 필드를 파싱
+//
+// 기존 경계 테스트는 MoveWritePos 로 채운 뒤 memcmp 로 바이트만 비교했다.
+// 여기서는 실제처럼 operator>> 파싱까지 연결해서 본다.
+//=============================================================================
+namespace RecvPath
+{
+    // 실제 MsgHeader 와 같은 모양 (size = 헤더 포함 전체 크기, type)
+#pragma pack(push, 1)
+    struct MsgHeader
+    {
+        uint16_t size;
+        uint16_t type;
+    };
+#pragma pack(pop)
+
+    const int HEADER_BYTES = (int)sizeof(MsgHeader);
+    const int MAX_PACKET = MSG_DEFAULT_SIZE - HEADER_SIZE;   // 1458 — 실제 MAX_PACKET_SIZE 와 동일
+}
+
+void Test_RecvPathIntegration()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 1-6] recv 경로 통합 테스트 시작" << std::endl;
+    std::cout << "  목표: " << TestConfig::RECV_PATH_PACKETS << " 패킷" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    std::mt19937 gen(0x2ECFU);
+    std::uniform_int_distribution<int> fieldDis(1, 40);
+    std::uniform_int_distribution<int> chunkDis(1, 200);   // 소켓이 한 번에 주는 바이트 수
+
+    std::vector<char> wire;        // 송신측이 만들어 둔 바이트 (아직 도착 전)
+    std::vector<char> stream;      // 수신 링버퍼에 쌓인 바이트
+    wire.reserve(8192);
+    stream.reserve(8192);
+
+    uint64_t parsedPackets = 0;
+    uint64_t partialHeader = 0;    // 헤더도 다 안 온 경우
+    uint64_t partialBody = 0;      // 헤더는 왔는데 본문이 덜 온 경우
+    uint64_t sequence = 0;
+
+    while (parsedPackets < TestConfig::RECV_PATH_PACKETS)
+    {
+        // --- 송신측: 패킷을 만들어 wire 에 쌓는다 ---
+        while (wire.size() < 2048)
+        {
+            const int fieldCount = fieldDis(gen);
+            const int payloadBytes = (int)(sizeof(uint64_t) + fieldCount * sizeof(int));
+            const int totalSize = RecvPath::HEADER_BYTES + payloadBytes;
+            TEST_ASSERT(totalSize <= RecvPath::MAX_PACKET, "생성 패킷이 최대 크기를 넘음");
+
+            RecvPath::MsgHeader header;
+            header.size = (uint16_t)totalSize;
+            header.type = (uint16_t)fieldCount;
+
+            const size_t base = wire.size();
+            wire.resize(base + totalSize);
+            char* out = wire.data() + base;
+
+            std::memcpy(out, &header, RecvPath::HEADER_BYTES);
+            out += RecvPath::HEADER_BYTES;
+
+            const uint64_t seq = sequence++;
+            std::memcpy(out, &seq, sizeof(seq));
+            out += sizeof(seq);
+            for (int f = 0; f < fieldCount; ++f)
+            {
+                const int value = (int)(seq * 31 + f);
+                std::memcpy(out, &value, sizeof(value));
+                out += sizeof(value);
+            }
+        }
+
+        // --- 소켓: 임의 크기로 잘라서 전달한다 (패킷 경계와 무관) ---
+        const size_t chunk = (std::min)((size_t)chunkDis(gen), wire.size());
+        stream.insert(stream.end(), wire.begin(), wire.begin() + chunk);
+        wire.erase(wire.begin(), wire.begin() + chunk);
+
+        // --- 여기부터 ParsePackets 모사 ---
+        size_t consumed = 0;
+        while (parsedPackets < TestConfig::RECV_PATH_PACKETS)
+        {
+            const size_t dataSize = stream.size() - consumed;
+
+            // 1. 헤더 크기 체크
+            if (dataSize < (size_t)RecvPath::HEADER_BYTES)
+            {
+                ++partialHeader;
+                break;
+            }
+
+            // 2. 첫 2바이트(size) peek
+            uint16_t packetSize = 0;
+            std::memcpy(&packetSize, stream.data() + consumed, sizeof(uint16_t));
+
+            // 3~4. 크기 검증
+            const size_t totalPacketSize = packetSize;
+            TEST_ASSERT(totalPacketSize >= (size_t)RecvPath::HEADER_BYTES, "패킷 크기가 헤더보다 작음");
+            TEST_ASSERT(totalPacketSize <= (size_t)RecvPath::MAX_PACKET, "패킷 크기가 최대치 초과");
+
+            // 5. 전체 도착 확인 — 본문이 덜 왔으면 다음 recv 대기
+            if (dataSize < totalPacketSize)
+            {
+                ++partialBody;
+                break;
+            }
+
+            // 6. Alloc → GetWriteBufferPtr() 에 직접 적재 → MoveWritePos (실제 코드와 동일)
+            CSerialBuffer* pMsg = CSerialBuffer::Alloc();
+            std::memcpy(pMsg->GetWriteBufferPtr(), stream.data() + consumed, totalPacketSize);
+            const int movedSize = pMsg->MoveWritePos((int)totalPacketSize);
+            TEST_ASSERT(movedSize == (int)totalPacketSize, "MoveWritePos 실패 — 불변식 위반");
+            TEST_ASSERT(pMsg->GetDataSize() == (int)totalPacketSize, "적재 후 DataSize 불일치");
+
+            consumed += totalPacketSize;
+
+            // 7. 컨텐츠 파싱 — 헤더도 페이로드 영역에 들어있으므로 함께 읽어낸다
+            uint16_t outSize = 0, outType = 0;
+            *pMsg >> outSize >> outType;
+            TEST_ASSERT(outSize == packetSize, "역직렬화한 헤더 size 불일치");
+
+            uint64_t outSeq = 0;
+            *pMsg >> outSeq;
+
+            const int fieldCount = (int)outType;
+            for (int f = 0; f < fieldCount; ++f)
+            {
+                int value = 0;
+                *pMsg >> value;
+                TEST_ASSERT(value == (int)(outSeq * 31 + f), "역직렬화 필드 값 손상");
+            }
+            TEST_ASSERT(pMsg->GetDataSize() == 0, "패킷 소진 후 잔여 데이터 존재");
+
+            pMsg->SubRef();
+
+            ++parsedPackets;
+            g_totalIterations++;
+            PrintProgress("recv 경로", parsedPackets, TestConfig::RECV_PATH_PACKETS);
+        }
+
+        // 소비한 만큼 링버퍼에서 제거
+        if (consumed > 0)
+            stream.erase(stream.begin(), stream.begin() + consumed);
+    }
+
+    TEST_ASSERT(partialHeader > 0, "헤더 부분 수신이 한 번도 발생하지 않음 — 경로 미검증");
+    TEST_ASSERT(partialBody > 0, "본문 부분 수신이 한 번도 발생하지 않음 — 경로 미검증");
+    TEST_ASSERT(Pool()->GetLiveCount() == 0, "recv 경로 종료 후 누수된 버퍼 존재");
+
+    std::cout << "\n[PASS] recv 경로 통합 테스트 완료!" << std::endl;
+    std::cout << "  부분 수신 — 헤더 미완: " << partialHeader
+        << " / 본문 미완: " << partialBody << std::endl;
     g_testCount++;
 }
 
@@ -1605,6 +1858,40 @@ void Test_KnownHazards()
             "→ 사용 계약: 복사 대입 전 대상 버퍼 크기를 직접 확인할 것");
     }
 
+    // --- 8. 음수 크기가 위치 이동 함수를 통과한다 (C2 에서 발견) ---
+    //
+    //   MoveWritePos: IsFull(-1) 이 false 라 통과 → _rear -= 1, _DataSize -= 1
+    //   MoveReadPos : (_front + -1 > _rear) 가 false 라 else 분기 → _DataSize -= (-1)
+    //
+    // 둘 다 "성공"으로 보이는 값을 돌려주면서 내부 상태를 망가뜨린다.
+    // 버퍼를 버리기만 하면 안전하므로 여기서 실제로 확인한다.
+    {
+        CSerialBuffer writeBuf(128);
+        writeBuf.MoveWritePos(-1);
+        const int afterWrite = writeBuf.GetDataSize();
+
+        CSerialBuffer readBuf(128);
+        readBuf.MoveReadPos(-1);
+        const int afterRead = readBuf.GetDataSize();
+
+        std::cout << "  MoveWritePos(-1) 후 DataSize            : " << afterWrite << std::endl;
+        std::cout << "  MoveReadPos(-1) 후 DataSize             : " << afterRead << std::endl;
+
+        TEST_WARN(afterWrite == 0 && afterRead == 0,
+            "음수 크기가 MoveWritePos/MoveReadPos 를 통과해 내부 상태를 망가뜨린다. "
+            "MoveWritePos(-1) 은 쓰기 위치를 페이로드 앞쪽으로 밀고, "
+            "MoveReadPos(-1) 은 없던 데이터가 있는 것처럼 DataSize 를 늘린다. "
+            "→ IsFull/IsEmpty 에 음수 가드를 넣으면 함께 막힌다");
+    }
+
+    // --- 9. SetData/GetData 의 음수·nullptr 은 실행 점검하지 않는다 ---
+    //
+    // 둘 다 memcpy_s 까지 내려간다. MSVC 의 memcpy_s 는 잘못된 인자에서
+    // invalid parameter handler 를 부르고 기본 설정이면 프로세스를 죽인다.
+    // 즉 이 경로를 테스트로 실행하면 테스트가 서버를 죽이는 형태가 된다.
+    // (음수 size 가 가드를 통과한다는 사실 자체는 위 6번·8번에서 확인됨)
+    std::cout << "  SetData/GetData 의 음수·nullptr          : 실행 점검 제외 (memcpy_s 가 프로세스를 죽임)" << std::endl;
+
     if (g_warnCount.load() == 0)
         std::cout << "\n[PASS] 잠재 결함 점검 — 경고 없음" << std::endl;
     else
@@ -1626,22 +1913,24 @@ void PrintMenu()
     std::cout << "  2. 랜덤 혼합 타입 왕복 테스트" << std::endl;
     std::cout << "  3. 문자열 직렬화 테스트" << std::endl;
     std::cout << "  4. 경계 조건 테스트" << std::endl;
-    std::cout << "  5. Phase 1 전체 실행" << std::endl;
+    std::cout << "  5. 잘못된 인자 방어 테스트" << std::endl;
+    std::cout << "  6. recv 경로 통합 테스트" << std::endl;
+    std::cout << "  7. Phase 1 전체 실행" << std::endl;
     std::cout << "\n[Phase 2: 수명 / 봉인]" << std::endl;
-    std::cout << "  6. Seal 봉인 테스트" << std::endl;
-    std::cout << "  7. 참조 카운팅 기본 테스트" << std::endl;
-    std::cout << "  8. Phase 2 전체 실행" << std::endl;
+    std::cout << "  8. Seal 봉인 테스트" << std::endl;
+    std::cout << "  9. 참조 카운팅 기본 테스트" << std::endl;
+    std::cout << " 10. Phase 2 전체 실행" << std::endl;
     std::cout << "\n[Phase 3: 멀티스레드 / 실사용 소유권 경로]" << std::endl;
-    std::cout << "  9. 브로드캐스트 시나리오 테스트" << std::endl;
-    std::cout << " 10. 다중 스레드 수명 스트레스" << std::endl;
-    std::cout << " 11. 전송 실패 경로 테스트" << std::endl;
-    std::cout << " 12. 타겟 0명 브로드캐스트 테스트" << std::endl;
-    std::cout << " 13. 단건+배치 AddRef 혼합 테스트" << std::endl;
-    std::cout << " 14. Phase 3 전체 실행" << std::endl;
+    std::cout << " 11. 브로드캐스트 시나리오 테스트" << std::endl;
+    std::cout << " 12. 다중 스레드 수명 스트레스" << std::endl;
+    std::cout << " 13. 전송 실패 경로 테스트" << std::endl;
+    std::cout << " 14. 타겟 0명 브로드캐스트 테스트" << std::endl;
+    std::cout << " 15. 단건+배치 AddRef 혼합 테스트" << std::endl;
+    std::cout << " 16. Phase 3 전체 실행" << std::endl;
     std::cout << "\n[Phase 4: 잠재 결함 점검 (비파괴)]" << std::endl;
-    std::cout << " 15. 알려진 위험 지점 점검" << std::endl;
+    std::cout << " 17. 알려진 위험 지점 점검" << std::endl;
     std::cout << "\n[전체]" << std::endl;
-    std::cout << " 16. 전체 실행 (Phase 1 + 2 + 3 + 4)" << std::endl;
+    std::cout << " 18. 전체 실행 (Phase 1 + 2 + 3 + 4)" << std::endl;
     std::cout << "  0. 종료" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "선택: ";
@@ -1689,26 +1978,30 @@ int main()
             case 2: Test_RandomMixed(); break;
             case 3: Test_String(); break;
             case 4: Test_Boundary(); break;
-            case 5:
+            case 5: Test_InvalidArguments(); break;
+            case 6: Test_RecvPathIntegration(); break;
+            case 7:
                 std::cout << "\n[Phase 1 전체 실행]" << std::endl;
                 Test_BasicTypes();
                 Test_RandomMixed();
                 Test_String();
                 Test_Boundary();
+                Test_InvalidArguments();
+                Test_RecvPathIntegration();
                 break;
-            case 6: Test_Seal(); break;
-            case 7: Test_RefCountBasic(); break;
-            case 8:
+            case 8: Test_Seal(); break;
+            case 9: Test_RefCountBasic(); break;
+            case 10:
                 std::cout << "\n[Phase 2 전체 실행]" << std::endl;
                 Test_Seal();
                 Test_RefCountBasic();
                 break;
-            case 9: Test_BroadcastMT(); break;
-            case 10: Test_ConcurrentLifecycle(); break;
-            case 11: Test_SendFailurePaths(); break;
-            case 12: Test_ZeroTargetBroadcast(); break;
-            case 13: Test_MixedAddRef(); break;
-            case 14:
+            case 11: Test_BroadcastMT(); break;
+            case 12: Test_ConcurrentLifecycle(); break;
+            case 13: Test_SendFailurePaths(); break;
+            case 14: Test_ZeroTargetBroadcast(); break;
+            case 15: Test_MixedAddRef(); break;
+            case 16:
                 std::cout << "\n[Phase 3 전체 실행]" << std::endl;
                 Test_BroadcastMT();
                 Test_ConcurrentLifecycle();
@@ -1716,13 +2009,15 @@ int main()
                 Test_ZeroTargetBroadcast();
                 Test_MixedAddRef();
                 break;
-            case 15: Test_KnownHazards(); break;
-            case 16:
+            case 17: Test_KnownHazards(); break;
+            case 18:
                 std::cout << "\n[전체 테스트 실행]" << std::endl;
                 Test_BasicTypes();
                 Test_RandomMixed();
                 Test_String();
                 Test_Boundary();
+                Test_InvalidArguments();
+                Test_RecvPathIntegration();
                 Test_Seal();
                 Test_RefCountBasic();
                 Test_BroadcastMT();

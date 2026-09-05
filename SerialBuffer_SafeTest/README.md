@@ -5,18 +5,20 @@
   2 ─ Phase 1-2: 랜덤 혼합 타입 왕복
   3 ─ Phase 1-3: 문자열 직렬화
   4 ─ Phase 1-4: 경계 조건
-  5 ─ Phase 1 전체 (1→2→3→4)
-  6 ─ Phase 2-1: Seal 봉인
-  7 ─ Phase 2-2: 참조 카운팅
-  8 ─ Phase 2 전체 (6→7)
-  9 ─ Phase 3-1: 브로드캐스트 시나리오
- 10 ─ Phase 3-2: 다중 스레드 수명 스트레스
- 11 ─ Phase 3-3: 전송 실패 경로
- 12 ─ Phase 3-4: 타겟 0명 브로드캐스트
- 13 ─ Phase 3-5: 단건+배치 AddRef 혼합
- 14 ─ Phase 3 전체 (9→…→13)
- 15 ─ Phase 4: 잠재 결함 점검 (비파괴)
- 16 ─ 전체 실행 (1→…→15)
+  5 ─ Phase 1-5: 잘못된 인자 방어
+  6 ─ Phase 1-6: recv 경로 통합
+  7 ─ Phase 1 전체 (1→…→6)
+  8 ─ Phase 2-1: Seal 봉인
+  9 ─ Phase 2-2: 참조 카운팅
+ 10 ─ Phase 2 전체 (8→9)
+ 11 ─ Phase 3-1: 브로드캐스트 시나리오
+ 12 ─ Phase 3-2: 다중 스레드 수명 스트레스
+ 13 ─ Phase 3-3: 전송 실패 경로
+ 14 ─ Phase 3-4: 타겟 0명 브로드캐스트
+ 15 ─ Phase 3-5: 단건+배치 AddRef 혼합
+ 16 ─ Phase 3 전체 (11→…→15)
+ 17 ─ Phase 4: 잠재 결함 점검 (비파괴)
+ 18 ─ 전체 실행 (1→…→17)
   0 ─ 종료
 ═══════════════════════════════════
 
@@ -68,11 +70,22 @@ SerialBuffer_SafeTest/
 ├── 1-3. 문자열 직렬화 (100만회)
 │     [short 길이][본문] 형식. wide 는 길이가 바이트 수임을 확인.
 │     대응 operator>> 가 없어 수신측은 길이를 읽고 GetData 로 본문을 가져간다
-└── 1-4. 경계 조건
+├── 1-4. 경계 조건
       IsFull/IsEmpty, 정확히 가득 채우기, 초과 쓰기 거부,
       언더플로우 시 값 0 초기화·위치 불변, PeekData 비파괴,
       MoveWritePos/MoveReadPos(초과 시 보유량까지만 클램프),
-      헤더 2바이트 예약 영역과 페이로드의 분리
+│     헤더 2바이트 예약 영역과 페이로드의 분리
+├── 1-5. 잘못된 인자 방어
+│     size=0 은 상태를 바꾸지 않고 0 을 반환하는지,
+│     음수 크기가 MoveWritePos/MoveReadPos 를 통과하는지.
+│     SetData/GetData 의 음수·nullptr 은 실행하지 않는다 — memcpy_s 가
+│     MSVC 에서 프로세스를 죽이므로 테스트가 서버를 죽이는 형태가 된다.
+└── 1-6. recv 경로 통합 (200만 패킷)
+      CIOCPServer::ParsePackets 를 그대로 모사한다.
+      소켓이 패킷 경계와 무관하게 임의 크기로 잘라 주고,
+      헤더 peek → 크기 검증 → Alloc → GetWriteBufferPtr 직접 적재 →
+      MoveWritePos → operator>> 파싱까지 연결해서 본다.
+      헤더 미완/본문 미완 두 부분 수신 경로가 모두 발생하는지 확인한다.
 
 [Phase 2: 수명 / 봉인]
 │
@@ -110,7 +123,7 @@ SerialBuffer_SafeTest/
 [Phase 4: 잠재 결함 점검 (비파괴)]
   코드를 읽어 찾은 의심 지점이 실제로 성립하는지 계산으로만 확인하고
   경고를 남긴다. 실제로 트리거하면 버퍼 밖에 쓰거나 쓰레기를 읽으므로
-  죽이지 않는다. 현재 6건 검출:
+  죽이지 않는다. 현재 7건 검출:
 
   1) Clear 없이 전부 읽은 뒤 다시 쓰기
      IsFull 은 _DataSize 기준인데 쓰기는 _rear 위치에 한다.
@@ -153,6 +166,13 @@ SerialBuffer_SafeTest/
      대상 버퍼가 작으면 복사를 건너뛰지만 반환값이 없어 호출부가 모른다.
      복사됐다고 믿고 쓰면 빈 버퍼를 전송하게 된다.
      → 계약: 복사 대입 전 대상 버퍼 크기를 직접 확인할 것
+
+  7) 음수 크기가 위치 이동 함수를 통과
+     MoveWritePos(-1) 은 IsFull(-1)==false 로 통과해 쓰기 위치를
+     페이로드 앞쪽으로 밀고 DataSize 를 -1 로 만든다.
+     MoveReadPos(-1) 은 없던 데이터가 있는 것처럼 DataSize 를 늘린다.
+     둘 다 "성공"처럼 보이는 값을 돌려준다.
+     → IsFull/IsEmpty 에 음수 가드를 넣으면 함께 막힌다
 
 [반복 횟수 조절]
   SerialBuffer_SafeTest.cpp 상단 namespace TestConfig 의 상수를 수정한다.
