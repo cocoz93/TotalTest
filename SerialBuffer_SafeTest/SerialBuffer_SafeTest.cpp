@@ -46,9 +46,12 @@ namespace TestConfig
     const uint64_t LIFECYCLE_CYCLES = 1'000'000;            // Alloc→SubRef 사이클
     const int64_t  BATCH_ADDREF_TARGETS = 1'000;            // 배치 AddRef 타겟 수
 
-    // Phase 3: 멀티스레드
+    // Phase 3: 멀티스레드 / 실사용 소유권 경로
     const uint64_t MT_CYCLES_PER_THREAD = 300'000;          // 스레드당 Alloc/Free 사이클
     const uint64_t BROADCAST_ROUNDS = 200'000;              // 브로드캐스트 라운드
+    const uint64_t SEND_FAILURE_ROUNDS = 200'000;           // 전송 실패 혼합 라운드
+    const uint64_t ZERO_TARGET_ROUNDS = 500'000;            // 타겟 0명 브로드캐스트 라운드
+    const uint64_t MIXED_ADDREF_ROUNDS = 200'000;           // 단건+배치 AddRef 혼합 라운드
 
     // 진행 상황 출력 주기
     const uint64_t PROGRESS_INTERVAL = 500'000;
@@ -894,6 +897,512 @@ void Test_ConcurrentLifecycle()
 }
 
 //=============================================================================
+// Phase 3-3: 전송 실패 경로 (A1)
+//
+// CIOCPServer::RequestSendMsg 의 소유권 계약:
+//   "호출자는 RefCount >= 1 인 pMsg 를 넘긴다. 이 함수는 해당 1개 ref 를 소비한다."
+//   세션 무효 / ABA 검출 / SendQ 상한 / Enqueue 실패 / 링버퍼 오버플로우 —
+//   조기 반환 경로 전부가 SubRef() 를 정확히 1회 부른다.
+//
+// 성공 경로만 도는 테스트로는 이 계약이 깨져도 모른다. 실패를 섞어서
+// "부여한 소유권 수 == 소비한 소유권 수" 가 유지되는지 본다.
+//=============================================================================
+namespace SendPath
+{
+    enum class Result
+    {
+        Sent,               // 정상 enqueue
+        SessionInvalid,     // FindSession 실패
+        AbaDetected,        // pin 후 sessionId 재확인 실패
+        QueueOverflow       // SendQ 상한 / Enqueue 실패
+    };
+
+    // 실제 RequestSendMsg 의 소유권 동작만 떼어낸 모사본.
+    // 어느 경로로 빠지든 SubRef 는 정확히 1회 — 이것이 검증 대상 계약이다.
+    Result SimulateRequestSendMsg(CSerialBuffer* msg, uint32_t roll)
+    {
+        Result result;
+        if (roll % 17 == 0)      result = Result::SessionInvalid;
+        else if (roll % 23 == 0) result = Result::AbaDetected;
+        else if (roll % 31 == 0) result = Result::QueueOverflow;
+        else                     result = Result::Sent;
+
+        // 전송 성공 경로에서는 버퍼를 실제로 읽는다 (봉인된 상태에서 PeekData)
+        if (result == Result::Sent)
+        {
+            char local[16];
+            msg->PeekData(local, sizeof(local));
+        }
+
+        msg->SubRef();
+        return result;
+    }
+}
+
+void Test_SendFailurePaths()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 3-3] 전송 실패 경로 테스트 시작" << std::endl;
+    std::cout << "  라운드: " << TestConfig::SEND_FAILURE_ROUNDS << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    const uint64_t PATTERN_MASK = 0x5A5A5A5A5A5A5A5AULL;
+
+    // --- 0. 검증 장치가 실제로 누수를 잡는지 먼저 확인 (테스트의 테스트) ---
+    //     소유권을 N개 부여하고 N-1 번만 소비하면 회수가 안 되어야 한다.
+    {
+        Pool()->ResetCounters();
+        CSerialBuffer* msg = CSerialBuffer::Alloc();
+        *msg << (uint64_t)1 << (uint64_t)(1 ^ PATTERN_MASK);
+        msg->Seal();
+
+        const int64_t targets = 10;
+        msg->AddRef(targets);
+        for (int64_t i = 0; i < targets - 1; ++i)   // 일부러 1회 덜 소비
+            msg->SubRef();
+        msg->SubRef();                              // 빌더 몫
+
+        TEST_ASSERT(Pool()->GetFreeCount() == 0, "소유권이 남았는데 회수됨");
+        TEST_ASSERT(Pool()->GetLiveCount() == 1, "누수가 감지되지 않음 — 검증 장치가 무력함");
+
+        msg->SubRef();                              // 정리
+        TEST_ASSERT(Pool()->GetLiveCount() == 0, "정리 실패");
+    }
+    std::cout << "  [OK] 검증 장치 자체 확인 — 소비 1회 누락을 실제로 잡아냄" << std::endl;
+
+    // --- 1. 실패를 섞은 브로드캐스트 (단일 스레드) ---
+    {
+        Pool()->ResetCounters();
+        std::mt19937 gen(0xFA11U);
+        uint64_t sentCount = 0, failCount = 0;
+
+        for (uint64_t round = 0; round < TestConfig::SEND_FAILURE_ROUNDS; ++round)
+        {
+            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            *msg << round << (uint64_t)(round ^ PATTERN_MASK);
+            msg->Seal();
+
+            // 실제 코드처럼 유효 타겟을 선카운트한 뒤 배치 AddRef
+            const int64_t validCount = (int64_t)(gen() % 17);   // 0~16명
+            if (validCount > 0)
+                msg->AddRef(validCount);
+
+            for (int64_t t = 0; t < validCount; ++t)
+            {
+                if (SendPath::SimulateRequestSendMsg(msg, gen()) == SendPath::Result::Sent)
+                    ++sentCount;
+                else
+                    ++failCount;
+            }
+
+            msg->SubRef();   // 빌더가 넘긴 소유권 1 회수 (타겟 0명이어도 안전)
+
+            g_totalIterations++;
+            PrintProgress("전송 실패 혼합", round + 1, TestConfig::SEND_FAILURE_ROUNDS);
+        }
+
+        TEST_ASSERT(failCount > 0, "실패 경로가 한 번도 발생하지 않음 — 테스트가 무의미");
+        TEST_ASSERT(Pool()->GetAllocCount() == (int64_t)TestConfig::SEND_FAILURE_ROUNDS, "Alloc 총량 불일치");
+        TEST_ASSERT(Pool()->GetFreeCount() == (int64_t)TestConfig::SEND_FAILURE_ROUNDS,
+            "Free 총량 불일치 — 실패 경로에서 소유권이 새거나 중복 회수됨");
+        TEST_ASSERT(Pool()->GetLiveCount() == 0, "종료 후 누수된 버퍼 존재");
+
+        std::cout << "  [OK] 실패 혼합 " << TestConfig::SEND_FAILURE_ROUNDS << " 라운드 "
+            << "(성공 " << sentCount << " / 실패 " << failCount << ") — 누수 0" << std::endl;
+    }
+
+    // --- 2. 전 타겟 실패 (세션이 전부 끊긴 상황) ---
+    {
+        Pool()->ResetCounters();
+
+        for (uint64_t round = 0; round < TestConfig::SEND_FAILURE_ROUNDS / 10; ++round)
+        {
+            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            *msg << round << (uint64_t)(round ^ PATTERN_MASK);
+            msg->Seal();
+
+            const int64_t validCount = 8;
+            msg->AddRef(validCount);
+            for (int64_t t = 0; t < validCount; ++t)
+                SendPath::SimulateRequestSendMsg(msg, 17);   // 항상 SessionInvalid
+
+            msg->SubRef();
+        }
+
+        const int64_t rounds = (int64_t)(TestConfig::SEND_FAILURE_ROUNDS / 10);
+        TEST_ASSERT(Pool()->GetFreeCount() == rounds, "전 타겟 실패 시 Free 총량 불일치");
+        TEST_ASSERT(Pool()->GetLiveCount() == 0, "전 타겟 실패 시 누수 발생");
+        std::cout << "  [OK] 전 타겟 실패 " << rounds << " 라운드 — 누수 0" << std::endl;
+    }
+
+    // --- 3. 멀티스레드: 워커가 실패/성공을 섞어 소비 ---
+    {
+        const int threadCounts[] = { 4, 16 };
+
+        for (int threadCount : threadCounts)
+        {
+            Pool()->ResetCounters();
+
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::vector<CSerialBuffer*> pending;
+            bool closed = false;
+            std::atomic<uint64_t> consumed(0);
+            std::atomic<uint64_t> corrupted(0);
+
+            std::vector<std::thread> workers;
+            for (int t = 0; t < threadCount; ++t)
+            {
+                workers.emplace_back([&]()
+                    {
+                        std::mt19937 gen(0xBEEF0000U + (uint32_t)std::hash<std::thread::id>()(std::this_thread::get_id()));
+                        std::vector<CSerialBuffer*> batch;
+
+                        while (true)
+                        {
+                            {
+                                std::unique_lock<std::mutex> lock(mutex);
+                                cv.wait(lock, [&]() { return closed || !pending.empty(); });
+                                if (pending.empty() && closed)
+                                    break;
+                                batch.swap(pending);
+                            }
+
+                            for (CSerialBuffer* msg : batch)
+                            {
+                                // 봉인 버퍼 읽기 검증 후, 성공/실패 무관하게 ref 1개 소비
+                                char local[16];
+                                uint64_t sequence = 0, mirrored = 0;
+                                if (msg->PeekData(local, sizeof(local)) == (int)sizeof(local))
+                                {
+                                    std::memcpy(&sequence, local, sizeof(sequence));
+                                    std::memcpy(&mirrored, local + sizeof(sequence), sizeof(mirrored));
+                                    if ((sequence ^ PATTERN_MASK) != mirrored)
+                                        corrupted.fetch_add(1, std::memory_order_relaxed);
+                                }
+                                else
+                                {
+                                    corrupted.fetch_add(1, std::memory_order_relaxed);
+                                }
+
+                                SendPath::SimulateRequestSendMsg(msg, gen());
+                                consumed.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            batch.clear();
+                        }
+                    });
+            }
+
+            const uint64_t rounds = TestConfig::SEND_FAILURE_ROUNDS / 4;
+            for (uint64_t round = 0; round < rounds; ++round)
+            {
+                CSerialBuffer* msg = CSerialBuffer::Alloc();
+                *msg << round << (uint64_t)(round ^ PATTERN_MASK);
+                msg->Seal();
+                msg->AddRef(threadCount);
+
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    for (int t = 0; t < threadCount; ++t)
+                        pending.push_back(msg);
+                }
+                cv.notify_all();
+
+                msg->SubRef();
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                closed = true;
+            }
+            cv.notify_all();
+            for (auto& worker : workers)
+                worker.join();
+
+            TEST_ASSERT(corrupted.load() == 0, "실패 혼합 중 데이터 손상 발생");
+            TEST_ASSERT(consumed.load() == rounds * (uint64_t)threadCount, "소비 횟수 불일치");
+            TEST_ASSERT(Pool()->GetFreeCount() == (int64_t)rounds, "MT 실패 혼합 Free 총량 불일치");
+            TEST_ASSERT(Pool()->GetLiveCount() == 0, "MT 실패 혼합 후 누수 발생");
+
+            std::cout << "  [OK] MT 실패 혼합 (워커 " << threadCount << ") "
+                << rounds << " 라운드 — 누수 0" << std::endl;
+            g_totalIterations += rounds;
+        }
+    }
+
+    std::cout << "\n[PASS] 전송 실패 경로 테스트 완료!" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
+// Phase 3-4: 타겟 0명 브로드캐스트 (A2)
+//
+// 실제 코드는 유효 타겟이 0명이면 배치 AddRef 를 아예 하지 않고,
+// 빌더가 넘긴 소유권 1개만 SubRef 로 회수한다.
+//   if (validCount > 0) pMsg->AddRef(validCount);
+//   ...
+//   pMsg->SubRef();   // 타겟 0명이어도 안전 회수
+// AddRef(0) 을 부르는 변형도 같은 결과여야 한다.
+//=============================================================================
+void Test_ZeroTargetBroadcast()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 3-4] 타겟 0명 브로드캐스트 테스트 시작" << std::endl;
+    std::cout << "  라운드: " << TestConfig::ZERO_TARGET_ROUNDS << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    // --- 1. AddRef 자체를 생략하는 경로 (실제 코드) ---
+    {
+        Pool()->ResetCounters();
+
+        for (uint64_t round = 0; round < TestConfig::ZERO_TARGET_ROUNDS; ++round)
+        {
+            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            *msg << round;
+            msg->Seal();
+
+            const int64_t validCount = 0;
+            if (validCount > 0)
+                msg->AddRef(validCount);
+
+            TEST_ASSERT(msg->_RefCount.load() == 1, "타겟 0명인데 RefCount 가 1이 아님");
+
+            msg->SubRef();
+
+            g_totalIterations++;
+            PrintProgress("타겟 0명", round + 1, TestConfig::ZERO_TARGET_ROUNDS);
+        }
+
+        TEST_ASSERT(Pool()->GetFreeCount() == (int64_t)TestConfig::ZERO_TARGET_ROUNDS,
+            "타겟 0명 경로 Free 총량 불일치");
+        TEST_ASSERT(Pool()->GetLiveCount() == 0, "타겟 0명 경로에서 누수 발생");
+    }
+    std::cout << "  [OK] AddRef 생략 경로 — Free 정확히 " << TestConfig::ZERO_TARGET_ROUNDS << "회" << std::endl;
+
+    // --- 2. AddRef(0) 을 실제로 호출하는 변형 ---
+    {
+        Pool()->ResetCounters();
+        const uint64_t rounds = TestConfig::ZERO_TARGET_ROUNDS / 10;
+
+        for (uint64_t round = 0; round < rounds; ++round)
+        {
+            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            *msg << round;
+            msg->Seal();
+
+            msg->AddRef(0);   // 0 을 그대로 넘겨도 카운트가 흔들리면 안 된다
+            TEST_ASSERT(msg->_RefCount.load() == 1, "AddRef(0) 이 RefCount 를 변경함");
+
+            msg->SubRef();
+        }
+
+        TEST_ASSERT(Pool()->GetFreeCount() == (int64_t)rounds, "AddRef(0) 경로 Free 총량 불일치");
+        TEST_ASSERT(Pool()->GetLiveCount() == 0, "AddRef(0) 경로에서 누수 발생");
+    }
+    std::cout << "  [OK] AddRef(0) 명시 호출 — RefCount 불변, 회수 정상" << std::endl;
+
+    // --- 3. 타겟 수가 0과 N 사이를 오가는 혼합 ---
+    {
+        Pool()->ResetCounters();
+        std::mt19937 gen(0x2E20U);
+        const uint64_t rounds = TestConfig::ZERO_TARGET_ROUNDS / 5;
+        uint64_t zeroRounds = 0;
+
+        for (uint64_t round = 0; round < rounds; ++round)
+        {
+            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            *msg << round;
+            msg->Seal();
+
+            const int64_t validCount = (int64_t)(gen() % 4);   // 0~3, 0이 자주 나온다
+            if (validCount == 0)
+                ++zeroRounds;
+
+            if (validCount > 0)
+                msg->AddRef(validCount);
+            for (int64_t t = 0; t < validCount; ++t)
+                msg->SubRef();
+
+            msg->SubRef();
+        }
+
+        TEST_ASSERT(zeroRounds > 0, "0명 라운드가 한 번도 발생하지 않음");
+        TEST_ASSERT(Pool()->GetFreeCount() == (int64_t)rounds, "혼합 경로 Free 총량 불일치");
+        TEST_ASSERT(Pool()->GetLiveCount() == 0, "혼합 경로에서 누수 발생");
+        std::cout << "  [OK] 0명/N명 혼합 " << rounds << " 라운드 (0명 " << zeroRounds << "회) — 누수 0" << std::endl;
+    }
+
+    std::cout << "\n[PASS] 타겟 0명 브로드캐스트 테스트 완료!" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
+// Phase 3-5: 단건 + 배치 AddRef 혼합 (A3)
+//
+// 실제 코드는 한 버퍼에 두 방식을 섞어 쓴다:
+//   pMsg->AddRef();                  // 점프 폴백 / 직송 등록 1건당 소유권 1
+//   pMsg->AddRef(validCount);        // 섹터 팬아웃 타겟 수만큼 배치
+//   pMsg->SubRef();                  // 빌더 몫 회수
+// 부여 총합과 소비 총합이 맞으면 Free 는 정확히 1회여야 한다.
+//=============================================================================
+void Test_MixedAddRef()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 3-5] 단건+배치 AddRef 혼합 테스트 시작" << std::endl;
+    std::cout << "  라운드: " << TestConfig::MIXED_ADDREF_ROUNDS << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    // --- 1. 단일 스레드 혼합 ---
+    {
+        Pool()->ResetCounters();
+        std::mt19937 gen(0x3A3AU);
+        uint64_t totalGrants = 0;
+
+        for (uint64_t round = 0; round < TestConfig::MIXED_ADDREF_ROUNDS; ++round)
+        {
+            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            *msg << round;
+            msg->Seal();
+
+            int64_t grants = 0;
+
+            // 직송 등록 — 1건당 단건 AddRef
+            const int64_t directSends = (int64_t)(gen() % 5);
+            for (int64_t d = 0; d < directSends; ++d)
+            {
+                msg->AddRef();
+                ++grants;
+            }
+
+            // 섹터 팬아웃 — 타겟 수만큼 배치 AddRef
+            const int64_t fanoutTargets = (int64_t)(gen() % 9);
+            if (fanoutTargets > 0)
+            {
+                msg->AddRef(fanoutTargets);
+                grants += fanoutTargets;
+            }
+
+            // 점프 폴백 — 단건 AddRef 하나 더 (확률적)
+            const bool jumpFallback = (gen() % 3) == 0;
+            if (jumpFallback)
+            {
+                msg->AddRef();
+                ++grants;
+            }
+
+            TEST_ASSERT(msg->_RefCount.load() == grants + 1, "혼합 AddRef 후 RefCount 불일치");
+
+            // 소비 — 부여한 순서와 무관하게 총량만 맞추면 된다
+            for (int64_t g = 0; g < grants; ++g)
+            {
+                TEST_ASSERT(Pool()->GetLiveCount() == 1, "소유권이 남았는데 회수됨");
+                msg->SubRef();
+            }
+
+            msg->SubRef();   // 빌더 몫
+            totalGrants += (uint64_t)grants;
+
+            g_totalIterations++;
+            PrintProgress("AddRef 혼합", round + 1, TestConfig::MIXED_ADDREF_ROUNDS);
+        }
+
+        TEST_ASSERT(Pool()->GetFreeCount() == (int64_t)TestConfig::MIXED_ADDREF_ROUNDS,
+            "혼합 AddRef Free 총량 불일치");
+        TEST_ASSERT(Pool()->GetLiveCount() == 0, "혼합 AddRef 후 누수 발생");
+        std::cout << "  [OK] 단일 스레드 혼합 " << TestConfig::MIXED_ADDREF_ROUNDS
+            << " 라운드 (총 부여 " << totalGrants << ") — 누수 0" << std::endl;
+    }
+
+    // --- 2. 멀티스레드: 부여와 소비가 서로 다른 스레드에서 일어난다 ---
+    {
+        const int CONSUMER_COUNT = 8;
+        Pool()->ResetCounters();
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<CSerialBuffer*> pending;
+        bool closed = false;
+        std::atomic<uint64_t> consumed(0);
+
+        std::vector<std::thread> consumers;
+        for (int t = 0; t < CONSUMER_COUNT; ++t)
+        {
+            consumers.emplace_back([&]()
+                {
+                    std::vector<CSerialBuffer*> batch;
+                    while (true)
+                    {
+                        {
+                            std::unique_lock<std::mutex> lock(mutex);
+                            cv.wait(lock, [&]() { return closed || !pending.empty(); });
+                            if (pending.empty() && closed)
+                                break;
+                            batch.swap(pending);
+                        }
+
+                        for (CSerialBuffer* msg : batch)
+                        {
+                            msg->SubRef();
+                            consumed.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        batch.clear();
+                    }
+                });
+        }
+
+        std::mt19937 gen(0x9C9CU);
+        const uint64_t rounds = TestConfig::MIXED_ADDREF_ROUNDS / 4;
+        uint64_t expectedConsumes = 0;
+
+        for (uint64_t round = 0; round < rounds; ++round)
+        {
+            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            *msg << round;
+            msg->Seal();
+
+            const int64_t singles = (int64_t)(gen() % 3);       // 단건
+            const int64_t batchCount = (int64_t)(gen() % 6);    // 배치
+
+            for (int64_t d = 0; d < singles; ++d)
+                msg->AddRef();
+            if (batchCount > 0)
+                msg->AddRef(batchCount);
+
+            const int64_t grants = singles + batchCount;
+            expectedConsumes += (uint64_t)grants;
+
+            if (grants > 0)
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (int64_t g = 0; g < grants; ++g)
+                    pending.push_back(msg);
+            }
+            cv.notify_all();
+
+            msg->SubRef();   // 빌더 몫 — 소비자보다 먼저 반납될 수 있다
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            closed = true;
+        }
+        cv.notify_all();
+        for (auto& consumer : consumers)
+            consumer.join();
+
+        TEST_ASSERT(consumed.load() == expectedConsumes, "MT 혼합 소비 횟수 불일치");
+        TEST_ASSERT(Pool()->GetFreeCount() == (int64_t)rounds, "MT 혼합 Free 총량 불일치");
+        TEST_ASSERT(Pool()->GetLiveCount() == 0, "MT 혼합 후 누수 발생");
+        std::cout << "  [OK] MT 혼합 (소비자 " << CONSUMER_COUNT << ") " << rounds
+            << " 라운드, 소비 " << consumed.load() << "회 — 누수 0" << std::endl;
+        g_totalIterations += rounds;
+    }
+
+    std::cout << "\n[PASS] 단건+배치 AddRef 혼합 테스트 완료!" << std::endl;
+    g_testCount++;
+}
+
+//=============================================================================
 // Phase 4: 잠재 결함 점검 (비파괴)
 //
 // 아래 두 가지는 코드를 읽어 찾은 의심 지점이다. 실제로 트리거하면 버퍼 밖으로
@@ -976,6 +1485,33 @@ void Test_KnownHazards()
             "→ 사용 계약: 읽기 전(_front==0) 상태에서만 복사 대입");
     }
 
+    // --- 3. 소유권을 초과 반납한 경우 (A4) ---
+    //
+    // SubRef 는 fetch_sub 결과가 정확히 1일 때만 Free 를 부른다.
+    // AddRef 보다 SubRef 를 많이 부르면 카운트가 음수로 내려가고 회수는 영영 안 된다.
+    // 실제로 SubRef 를 한 번 더 부르면 이미 회수된 객체를 만지게 되므로,
+    // 여기서는 RefCount 만 0 으로 맞춰놓고 SubRef 의 분기만 관찰한다.
+    {
+        Pool()->ResetCounters();
+        CSerialBuffer* msg = CSerialBuffer::Alloc();
+
+        msg->_RefCount.store(0);
+        msg->SubRef();
+
+        const bool freed = (Pool()->GetFreeCount() == 1);
+        std::cout << "  초과 반납 후 RefCount                  : " << msg->_RefCount.load() << std::endl;
+        std::cout << "  회수(Free) 되었는가                    : " << (freed ? "예" : "아니오") << std::endl;
+
+        TEST_WARN(freed,
+            "소유권을 초과 반납하면 Free 가 호출되지 않아 버퍼가 조용히 누수된다 "
+            "(SubRef 는 fetch_sub 결과가 정확히 1일 때만 회수). "
+            "→ 사용 계약: AddRef 횟수와 SubRef 횟수를 정확히 맞출 것");
+
+        msg->_RefCount.store(1);   // 정리
+        msg->SubRef();
+        TEST_ASSERT(Pool()->GetLiveCount() == 0, "A4 점검 후 정리 실패");
+    }
+
     if (g_warnCount.load() == 0)
         std::cout << "\n[PASS] 잠재 결함 점검 — 경고 없음" << std::endl;
     else
@@ -1002,14 +1538,17 @@ void PrintMenu()
     std::cout << "  6. Seal 봉인 테스트" << std::endl;
     std::cout << "  7. 참조 카운팅 기본 테스트" << std::endl;
     std::cout << "  8. Phase 2 전체 실행" << std::endl;
-    std::cout << "\n[Phase 3: 멀티스레드]" << std::endl;
+    std::cout << "\n[Phase 3: 멀티스레드 / 실사용 소유권 경로]" << std::endl;
     std::cout << "  9. 브로드캐스트 시나리오 테스트" << std::endl;
     std::cout << " 10. 다중 스레드 수명 스트레스" << std::endl;
-    std::cout << " 11. Phase 3 전체 실행" << std::endl;
+    std::cout << " 11. 전송 실패 경로 테스트" << std::endl;
+    std::cout << " 12. 타겟 0명 브로드캐스트 테스트" << std::endl;
+    std::cout << " 13. 단건+배치 AddRef 혼합 테스트" << std::endl;
+    std::cout << " 14. Phase 3 전체 실행" << std::endl;
     std::cout << "\n[Phase 4: 잠재 결함 점검 (비파괴)]" << std::endl;
-    std::cout << " 12. 알려진 위험 지점 점검" << std::endl;
+    std::cout << " 15. 알려진 위험 지점 점검" << std::endl;
     std::cout << "\n[전체]" << std::endl;
-    std::cout << " 13. 전체 실행 (Phase 1 + 2 + 3 + 4)" << std::endl;
+    std::cout << " 16. 전체 실행 (Phase 1 + 2 + 3 + 4)" << std::endl;
     std::cout << "  0. 종료" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "선택: ";
@@ -1073,13 +1612,19 @@ int main()
                 break;
             case 9: Test_BroadcastMT(); break;
             case 10: Test_ConcurrentLifecycle(); break;
-            case 11:
+            case 11: Test_SendFailurePaths(); break;
+            case 12: Test_ZeroTargetBroadcast(); break;
+            case 13: Test_MixedAddRef(); break;
+            case 14:
                 std::cout << "\n[Phase 3 전체 실행]" << std::endl;
                 Test_BroadcastMT();
                 Test_ConcurrentLifecycle();
+                Test_SendFailurePaths();
+                Test_ZeroTargetBroadcast();
+                Test_MixedAddRef();
                 break;
-            case 12: Test_KnownHazards(); break;
-            case 13:
+            case 15: Test_KnownHazards(); break;
+            case 16:
                 std::cout << "\n[전체 테스트 실행]" << std::endl;
                 Test_BasicTypes();
                 Test_RandomMixed();
@@ -1089,6 +1634,9 @@ int main()
                 Test_RefCountBasic();
                 Test_BroadcastMT();
                 Test_ConcurrentLifecycle();
+                Test_SendFailurePaths();
+                Test_ZeroTargetBroadcast();
+                Test_MixedAddRef();
                 Test_KnownHazards();
                 break;
             default:
