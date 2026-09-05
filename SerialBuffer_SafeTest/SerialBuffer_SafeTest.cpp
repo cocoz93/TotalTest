@@ -12,21 +12,29 @@
 #include <condition_variable>
 //=============================================================================
 // 테스트 대상 선택
-//   기본                      → SerialBuffer.h/.cpp  (MMOServer 원본 사본)
-//   -DUSE_FIXED_SERIALBUFFER  → SerialBuffer_Fixed.h/.cpp (수정본)
 //
-// 아래 테스트 본문은 두 경우 모두 한 글자도 바뀌지 않는다.
-// 수정본은 namespace Fixed 안에 있으므로, 원본 헤더를 포함하지 않는 빌드에서만
-// 전역 이름 CSerialBuffer 로 별칭을 건다.
+// 두 헤더를 모두 포함한다. 수정본은 namespace Fixed 안에 있어 충돌하지 않는다.
+//   ::CSerialBuffer        — 원본 사본
+//   Fixed::CSerialBuffer   — 수정본
+//
+// 테스트 14종은 UTBuffer 별칭이 가리키는 쪽을 돌린다:
+//   기본                      → 원본 사본
+//   -DUSE_FIXED_SERIALBUFFER  → 수정본
+//
+// Phase 5(동등성)만은 별칭과 무관하게 두 구현을 직접 맞대어 비교한다.
 //=============================================================================
-#ifdef USE_FIXED_SERIALBUFFER
-#include "SerialBuffer_Fixed.h"
-using CSerialBuffer = Fixed::CSerialBuffer;
-static constexpr int HEADER_SIZE = Fixed::HEADER_SIZE;
-static constexpr int MSG_DEFAULT_SIZE = Fixed::MSG_DEFAULT_SIZE;
-#else
 #include "SerialBuffer.h"
+#include "SerialBuffer_Fixed.h"
+
+#ifdef USE_FIXED_SERIALBUFFER
+using UTBuffer = Fixed::CSerialBuffer;
+#else
+using UTBuffer = ::CSerialBuffer;
 #endif
+
+// 두 구현의 버퍼 기하는 같아야 한다 — 다르면 동등성 비교 자체가 성립하지 않는다
+static_assert(HEADER_SIZE == Fixed::HEADER_SIZE, "HEADER_SIZE 불일치");
+static_assert(MSG_DEFAULT_SIZE == Fixed::MSG_DEFAULT_SIZE, "MSG_DEFAULT_SIZE 불일치");
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -70,6 +78,9 @@ namespace TestConfig
     const uint64_t SEND_FAILURE_ROUNDS = 200'000;           // 전송 실패 혼합 라운드
     const uint64_t ZERO_TARGET_ROUNDS = 500'000;            // 타겟 0명 브로드캐스트 라운드
     const uint64_t MIXED_ADDREF_ROUNDS = 200'000;           // 단건+배치 AddRef 혼합 라운드
+
+    // Phase 5: 원본 ↔ 수정본 동등성
+    const uint64_t EQUIVALENCE_ROUNDS = 2'000'000;          // 동등성 비교 라운드
 
     // 진행 상황 출력 주기
     const uint64_t PROGRESS_INTERVAL = 500'000;
@@ -121,9 +132,9 @@ void PrintProgress(const char* testName, uint64_t current, uint64_t total)
 }
 
 // 테스트용 프리리스트 (LockFreeConfig.h 대체본) 접근
-LockFree::CExternalTlsFreeList<CSerialBuffer>* Pool()
+LockFree::CExternalTlsFreeList<UTBuffer>* Pool()
 {
-    return CSerialBuffer::_TlsMsgFreeList;
+    return UTBuffer::_TlsMsgFreeList;
 }
 
 uint8_t MakeChecksum(const char* data, int size)
@@ -146,7 +157,7 @@ void Test_BasicTypes()
     std::cout << "  목표: " << TestConfig::BASIC_TYPE_ITERATIONS << " 번 반복" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    CSerialBuffer buffer(MSG_DEFAULT_SIZE);
+    UTBuffer buffer(MSG_DEFAULT_SIZE);
     std::mt19937_64 gen(0xC0FFEE);
 
     const int EXPECTED_SIZE =
@@ -219,7 +230,7 @@ void Test_RandomMixed()
     std::cout << "  목표: " << TestConfig::RANDOM_MIXED_ROUNDS << " 라운드" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    CSerialBuffer buffer(MSG_DEFAULT_SIZE);
+    UTBuffer buffer(MSG_DEFAULT_SIZE);
     std::mt19937_64 gen(0xBADC0DE);
     std::uniform_int_distribution<int> fieldCountDis(1, 100);
     std::uniform_int_distribution<int> typeDis(0, 5);
@@ -335,7 +346,7 @@ void Test_String()
     std::cout << "  목표: " << TestConfig::STRING_ITERATIONS << " 번 반복" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    CSerialBuffer buffer(MSG_DEFAULT_SIZE);
+    UTBuffer buffer(MSG_DEFAULT_SIZE);
     std::mt19937_64 gen(0x5EED5EED);
     std::uniform_int_distribution<int> lenDis(0, 200);
 
@@ -406,7 +417,7 @@ void Test_Boundary()
 
     // --- 1. 정확히 가득 채우기 ---
     {
-        CSerialBuffer buffer(BUFFER_SIZE);
+        UTBuffer buffer(BUFFER_SIZE);
         TEST_ASSERT(buffer.GetBufferSize() == BUFFER_SIZE, "GetBufferSize 불일치");
         TEST_ASSERT(buffer.GetDataSize() == 0, "초기 DataSize 불일치");
         TEST_ASSERT(buffer.IsFull(USABLE) == false, "정확히 맞는 크기를 가득으로 판정");
@@ -438,7 +449,7 @@ void Test_Boundary()
 
     // --- 2. 언더플로우 ---
     {
-        CSerialBuffer buffer(BUFFER_SIZE);
+        UTBuffer buffer(BUFFER_SIZE);
         buffer << (int)0x11223344;
 
         TEST_ASSERT(buffer.IsEmpty(5), "데이터보다 큰 요청을 읽기 가능으로 판정");
@@ -462,7 +473,7 @@ void Test_Boundary()
 
     // --- 3. PeekData 는 읽기 위치를 옮기지 않는다 ---
     {
-        CSerialBuffer buffer(BUFFER_SIZE);
+        UTBuffer buffer(BUFFER_SIZE);
         buffer << (uint32_t)0xDEADBEEF;
 
         uint32_t peeked = 0;
@@ -478,7 +489,7 @@ void Test_Boundary()
 
     // --- 4. MoveWritePos / MoveReadPos ---
     {
-        CSerialBuffer buffer(BUFFER_SIZE);
+        UTBuffer buffer(BUFFER_SIZE);
 
         // recv 가 직접 채운 상황 모사
         const char source[16] = "ZeroCopyWrite!";
@@ -498,7 +509,7 @@ void Test_Boundary()
 
     // --- 5. 헤더 영역과 페이로드 영역의 분리 ---
     {
-        CSerialBuffer buffer(BUFFER_SIZE);
+        UTBuffer buffer(BUFFER_SIZE);
         buffer << (uint64_t)0x1122334455667788ULL;
 
         TEST_ASSERT(buffer.GetPayloadBufferPtr() == buffer.GetHeaderBufferPtr() + HEADER_SIZE,
@@ -544,7 +555,7 @@ void Test_InvalidArguments()
 
     // --- 1. size = 0 은 무해해야 한다 ---
     {
-        CSerialBuffer buffer(128);
+        UTBuffer buffer(128);
         int payload = 0x11223344;
         buffer << payload;
 
@@ -568,7 +579,7 @@ void Test_InvalidArguments()
     //   IsFull(-1) 이 false 라 가드를 통과하고 _rear 가 뒤로 밀린다.
     //   상태가 오염되므로 이 버퍼는 이 블록 밖에서 쓰지 않는다.
     {
-        CSerialBuffer buffer(128);
+        UTBuffer buffer(128);
         TEST_ASSERT(buffer.GetDataSize() == 0, "초기 상태 불일치");
 
         const int moved = buffer.MoveWritePos(-1);
@@ -586,7 +597,7 @@ void Test_InvalidArguments()
     //   _front + size > _rear 비교가 음수에서 성립하지 않아 else 분기로 빠지고,
     //   _DataSize -= (음수) 가 되어 없던 데이터가 생긴다.
     {
-        CSerialBuffer buffer(128);
+        UTBuffer buffer(128);
         const int moved = buffer.MoveReadPos(-1);
         const int dataSize = buffer.GetDataSize();
 
@@ -600,7 +611,7 @@ void Test_InvalidArguments()
 
     // --- 4. IsEmpty / IsFull 의 0 과 음수 ---
     {
-        CSerialBuffer buffer(128);
+        UTBuffer buffer(128);
         buffer << (int)0;
 
         // 0 바이트 요청은 언제나 가능해야 한다 — 이건 계약이다
@@ -738,7 +749,7 @@ void Test_RecvPathIntegration()
             }
 
             // 6. Alloc → GetWriteBufferPtr() 에 직접 적재 → MoveWritePos (실제 코드와 동일)
-            CSerialBuffer* pMsg = CSerialBuffer::Alloc();
+            UTBuffer* pMsg = UTBuffer::Alloc();
             std::memcpy(pMsg->GetWriteBufferPtr(), stream.data() + consumed, totalPacketSize);
             const int movedSize = pMsg->MoveWritePos((int)totalPacketSize);
             TEST_ASSERT(movedSize == (int)totalPacketSize, "MoveWritePos 실패 — 불변식 위반");
@@ -795,7 +806,7 @@ void Test_Seal()
     std::cout << "[Phase 2-1] Seal 봉인 테스트 시작" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    CSerialBuffer buffer(128);
+    UTBuffer buffer(128);
     TEST_ASSERT(buffer.IsSealed() == false, "초기 상태가 봉인됨");
 
     buffer << (int)0x11223344 << (int)0x55667788;
@@ -856,7 +867,7 @@ void Test_RefCountBasic()
     // --- 1. Alloc 직후 소유권 1개 ---
     {
         Pool()->ResetCounters();
-        CSerialBuffer* msg = CSerialBuffer::Alloc();
+        UTBuffer* msg = UTBuffer::Alloc();
 
         TEST_ASSERT(Pool()->GetAllocCount() == 1, "Alloc 횟수 불일치");
         TEST_ASSERT(msg->_RefCount.load() == 1, "Alloc 반환 버퍼의 RefCount 가 1이 아님");
@@ -872,7 +883,7 @@ void Test_RefCountBasic()
     // --- 2. AddRef / SubRef 균형 ---
     {
         Pool()->ResetCounters();
-        CSerialBuffer* msg = CSerialBuffer::Alloc();
+        UTBuffer* msg = UTBuffer::Alloc();
 
         for (int i = 0; i < 100; ++i)
             msg->AddRef();
@@ -895,7 +906,7 @@ void Test_RefCountBasic()
     // --- 3. 배치 AddRef (브로드캐스트 타겟 수만큼 1회) ---
     {
         Pool()->ResetCounters();
-        CSerialBuffer* msg = CSerialBuffer::Alloc();
+        UTBuffer* msg = UTBuffer::Alloc();
 
         const int64_t targets = TestConfig::BATCH_ADDREF_TARGETS;
         msg->AddRef(targets);
@@ -920,7 +931,7 @@ void Test_RefCountBasic()
 
         for (uint64_t i = 1; i <= TestConfig::LIFECYCLE_CYCLES; ++i)
         {
-            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            UTBuffer* msg = UTBuffer::Alloc();
             msg->AddRef(3);
             *msg << (uint64_t)i;
             msg->Seal();
@@ -973,7 +984,7 @@ void Test_BroadcastMT()
     {
         std::mutex mutex;
         std::condition_variable cv;
-        std::vector<CSerialBuffer*> pending;
+        std::vector<UTBuffer*> pending;
         bool closed = false;
     };
 
@@ -997,7 +1008,7 @@ void Test_BroadcastMT()
             WorkerQueue* queue = queues[t].get();
             workers.emplace_back([queue, &sendOk, &sendFail, PATTERN_MASK]()
                 {
-                    std::vector<CSerialBuffer*> batch;
+                    std::vector<UTBuffer*> batch;
 
                     while (true)
                     {
@@ -1011,7 +1022,7 @@ void Test_BroadcastMT()
                             batch.swap(queue->pending);
                         }
 
-                        for (CSerialBuffer* msg : batch)
+                        for (UTBuffer* msg : batch)
                         {
                             // 봉인된 버퍼를 여러 워커가 동시에 읽는다 (PeekData 는 위치를 안 옮김)
                             char local[16];
@@ -1044,7 +1055,7 @@ void Test_BroadcastMT()
         // --- 송신 스레드 (여기, 메인) ---
         for (uint64_t round = 0; round < TestConfig::BROADCAST_ROUNDS; ++round)
         {
-            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            UTBuffer* msg = UTBuffer::Alloc();
 
             const uint64_t sequence = round;
             *msg << sequence << (uint64_t)(sequence ^ PATTERN_MASK);
@@ -1131,7 +1142,7 @@ void Test_ConcurrentLifecycle()
 
                     for (uint64_t cycle = 0; cycle < TestConfig::MT_CYCLES_PER_THREAD; ++cycle)
                     {
-                        CSerialBuffer* msg = CSerialBuffer::Alloc();
+                        UTBuffer* msg = UTBuffer::Alloc();
 
                         const uint64_t sequence = threadTag ^ cycle;
                         *msg << sequence << (int)t << (double)cycle;
@@ -1196,7 +1207,7 @@ namespace SendPath
 
     // 실제 RequestSendMsg 의 소유권 동작만 떼어낸 모사본.
     // 어느 경로로 빠지든 SubRef 는 정확히 1회 — 이것이 검증 대상 계약이다.
-    Result SimulateRequestSendMsg(CSerialBuffer* msg, uint32_t roll)
+    Result SimulateRequestSendMsg(UTBuffer* msg, uint32_t roll)
     {
         Result result;
         if (roll % 17 == 0)      result = Result::SessionInvalid;
@@ -1229,7 +1240,7 @@ void Test_SendFailurePaths()
     //     소유권을 N개 부여하고 N-1 번만 소비하면 회수가 안 되어야 한다.
     {
         Pool()->ResetCounters();
-        CSerialBuffer* msg = CSerialBuffer::Alloc();
+        UTBuffer* msg = UTBuffer::Alloc();
         *msg << (uint64_t)1 << (uint64_t)(1 ^ PATTERN_MASK);
         msg->Seal();
 
@@ -1255,7 +1266,7 @@ void Test_SendFailurePaths()
 
         for (uint64_t round = 0; round < TestConfig::SEND_FAILURE_ROUNDS; ++round)
         {
-            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            UTBuffer* msg = UTBuffer::Alloc();
             *msg << round << (uint64_t)(round ^ PATTERN_MASK);
             msg->Seal();
 
@@ -1294,7 +1305,7 @@ void Test_SendFailurePaths()
 
         for (uint64_t round = 0; round < TestConfig::SEND_FAILURE_ROUNDS / 10; ++round)
         {
-            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            UTBuffer* msg = UTBuffer::Alloc();
             *msg << round << (uint64_t)(round ^ PATTERN_MASK);
             msg->Seal();
 
@@ -1322,7 +1333,7 @@ void Test_SendFailurePaths()
 
             std::mutex mutex;
             std::condition_variable cv;
-            std::vector<CSerialBuffer*> pending;
+            std::vector<UTBuffer*> pending;
             bool closed = false;
             std::atomic<uint64_t> consumed(0);
             std::atomic<uint64_t> corrupted(0);
@@ -1333,7 +1344,7 @@ void Test_SendFailurePaths()
                 workers.emplace_back([&]()
                     {
                         std::mt19937 gen(0xBEEF0000U + (uint32_t)std::hash<std::thread::id>()(std::this_thread::get_id()));
-                        std::vector<CSerialBuffer*> batch;
+                        std::vector<UTBuffer*> batch;
 
                         while (true)
                         {
@@ -1345,7 +1356,7 @@ void Test_SendFailurePaths()
                                 batch.swap(pending);
                             }
 
-                            for (CSerialBuffer* msg : batch)
+                            for (UTBuffer* msg : batch)
                             {
                                 // 봉인 버퍼 읽기 검증 후, 성공/실패 무관하게 ref 1개 소비
                                 char local[16];
@@ -1373,7 +1384,7 @@ void Test_SendFailurePaths()
             const uint64_t rounds = TestConfig::SEND_FAILURE_ROUNDS / 4;
             for (uint64_t round = 0; round < rounds; ++round)
             {
-                CSerialBuffer* msg = CSerialBuffer::Alloc();
+                UTBuffer* msg = UTBuffer::Alloc();
                 *msg << round << (uint64_t)(round ^ PATTERN_MASK);
                 msg->Seal();
                 msg->AddRef(threadCount);
@@ -1434,7 +1445,7 @@ void Test_ZeroTargetBroadcast()
 
         for (uint64_t round = 0; round < TestConfig::ZERO_TARGET_ROUNDS; ++round)
         {
-            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            UTBuffer* msg = UTBuffer::Alloc();
             *msg << round;
             msg->Seal();
 
@@ -1463,7 +1474,7 @@ void Test_ZeroTargetBroadcast()
 
         for (uint64_t round = 0; round < rounds; ++round)
         {
-            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            UTBuffer* msg = UTBuffer::Alloc();
             *msg << round;
             msg->Seal();
 
@@ -1487,7 +1498,7 @@ void Test_ZeroTargetBroadcast()
 
         for (uint64_t round = 0; round < rounds; ++round)
         {
-            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            UTBuffer* msg = UTBuffer::Alloc();
             *msg << round;
             msg->Seal();
 
@@ -1537,7 +1548,7 @@ void Test_MixedAddRef()
 
         for (uint64_t round = 0; round < TestConfig::MIXED_ADDREF_ROUNDS; ++round)
         {
-            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            UTBuffer* msg = UTBuffer::Alloc();
             *msg << round;
             msg->Seal();
 
@@ -1597,7 +1608,7 @@ void Test_MixedAddRef()
 
         std::mutex mutex;
         std::condition_variable cv;
-        std::vector<CSerialBuffer*> pending;
+        std::vector<UTBuffer*> pending;
         bool closed = false;
         std::atomic<uint64_t> consumed(0);
 
@@ -1606,7 +1617,7 @@ void Test_MixedAddRef()
         {
             consumers.emplace_back([&]()
                 {
-                    std::vector<CSerialBuffer*> batch;
+                    std::vector<UTBuffer*> batch;
                     while (true)
                     {
                         {
@@ -1617,7 +1628,7 @@ void Test_MixedAddRef()
                             batch.swap(pending);
                         }
 
-                        for (CSerialBuffer* msg : batch)
+                        for (UTBuffer* msg : batch)
                         {
                             msg->SubRef();
                             consumed.fetch_add(1, std::memory_order_relaxed);
@@ -1633,7 +1644,7 @@ void Test_MixedAddRef()
 
         for (uint64_t round = 0; round < rounds; ++round)
         {
-            CSerialBuffer* msg = CSerialBuffer::Alloc();
+            UTBuffer* msg = UTBuffer::Alloc();
             *msg << round;
             msg->Seal();
 
@@ -1701,7 +1712,7 @@ void Test_KnownHazards()
         const int BUFFER_SIZE = 64;
         const int USABLE = BUFFER_SIZE - HEADER_SIZE;
 
-        CSerialBuffer buffer(BUFFER_SIZE);
+        UTBuffer buffer(BUFFER_SIZE);
 
         char filler[USABLE];
         std::memset(filler, 0x5A, sizeof(filler));
@@ -1731,8 +1742,8 @@ void Test_KnownHazards()
     // 유효 데이터 구간은 [HEADER_SIZE + _front, HEADER_SIZE + _rear) 다.
     // _front > 0 이면 복사 길이가 모자라 뒷부분이 빠진다.
     {
-        CSerialBuffer src(64);
-        CSerialBuffer dst(64);
+        UTBuffer src(64);
+        UTBuffer dst(64);
 
         for (int i = 0; i < 5; ++i)
             src << (int)(0x11111111 * (i + 1));
@@ -1770,7 +1781,7 @@ void Test_KnownHazards()
     // 여기서는 RefCount 만 0 으로 맞춰놓고 SubRef 의 분기만 관찰한다.
     {
         Pool()->ResetCounters();
-        CSerialBuffer* msg = CSerialBuffer::Alloc();
+        UTBuffer* msg = UTBuffer::Alloc();
 
         msg->_RefCount.store(0);
         msg->SubRef();
@@ -1798,13 +1809,13 @@ void Test_KnownHazards()
     // --- 4. Release() 이중 호출 (B1) ---
     //
     //   void Release(void) { delete[] _Buff; }   // _Buff 를 null 로 만들지 않는다
-    //   ~CSerialBuffer()   { Release(); }        // 소멸자도 같은 함수를 부른다
+    //   ~UTBuffer()   { Release(); }        // 소멸자도 같은 함수를 부른다
     //
     // Release() 가 public 이라 외부에서 부를 수 있고, 그 뒤 소멸하면 두 번째 delete[] 가 일어난다.
     // 실제로 이중 해제를 일으키면 프로세스가 죽으므로 "Release() 후에도 포인터가 그대로 남는지"만
     // 확인하고(역참조하지 않는다), 곧바로 Initialize() 로 새 버퍼를 물려 소멸자를 안전하게 만든다.
     {
-        CSerialBuffer buffer(64);
+        UTBuffer buffer(64);
         char* before = buffer.GetHeaderBufferPtr();
         TEST_ASSERT(before != nullptr, "초기 버퍼가 nullptr");
 
@@ -1850,7 +1861,7 @@ void Test_KnownHazards()
         const size_t hugeLength = 40000;              // 32767 초과
         const short truncated = (short)hugeLength;    // 음수로 잘린다
 
-        CSerialBuffer big((int)hugeLength + 16);
+        UTBuffer big((int)hugeLength + 16);
         const bool guardBlocks = big.IsFull((int)(sizeof(short) + truncated));
 
         std::cout << "  40000자 문자열의 기록 길이              : " << truncated << std::endl;
@@ -1867,11 +1878,11 @@ void Test_KnownHazards()
     //   int srcTotalSize = HEADER_SIZE + SrcMsg._DataSize;
     //   if (srcTotalSize > _BufferSize) return *this;   // 아무 표시 없이 무시
     {
-        CSerialBuffer src(1000);
+        UTBuffer src(1000);
         for (int i = 0; i < 100; ++i)
             src << (int)i;                 // 400 바이트
 
-        CSerialBuffer dst(64);             // 담을 수 없는 크기
+        UTBuffer dst(64);             // 담을 수 없는 크기
         const int beforeSize = dst.GetDataSize();
         dst = src;
         const int afterSize = dst.GetDataSize();
@@ -1901,11 +1912,11 @@ void Test_KnownHazards()
     // 둘 다 "성공"으로 보이는 값을 돌려주면서 내부 상태를 망가뜨린다.
     // 버퍼를 버리기만 하면 안전하므로 여기서 실제로 확인한다.
     {
-        CSerialBuffer writeBuf(128);
+        UTBuffer writeBuf(128);
         writeBuf.MoveWritePos(-1);
         const int afterWrite = writeBuf.GetDataSize();
 
-        CSerialBuffer readBuf(128);
+        UTBuffer readBuf(128);
         readBuf.MoveReadPos(-1);
         const int afterRead = readBuf.GetDataSize();
 
@@ -1932,6 +1943,204 @@ void Test_KnownHazards()
     else
         std::cout << "\n[WARN] 잠재 결함 점검 — 경고 " << g_warnCount.load() << "건 (위 내용 확인)" << std::endl;
 
+    g_testCount++;
+}
+
+//=============================================================================
+// Phase 5: 원본 ↔ 수정본 동등성 (와이어 호환)
+//
+// 14종 테스트는 UTBuffer 가 가리키는 한쪽만 돌린다. 둘 다 PASS 라는 것과
+// "둘이 같은 바이트를 만든다"는 것은 다른 얘기다. 여기서는 두 구현을 직접
+// 맞대어 비교한다.
+//
+// 이게 필요한 이유: 수정본을 서버에 반영할 때 송신·수신 양쪽을 동시에
+// 바꾸지 않아도 되려면, 수정본이 만든 패킷을 원본이 그대로 파싱할 수 있어야
+// 한다. 그 호환성을 여기서 증명한다.
+//
+// 프리리스트를 쓰지 않고 스택 객체로 비교한다 (두 클래스가 각자의 정적
+// 프리리스트를 갖고 있어, 한쪽만 초기화된 상태에서도 안전하게 돌리기 위함).
+//=============================================================================
+void Test_Equivalence()
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "[Phase 5] 원본 ↔ 수정본 동등성 테스트 시작" << std::endl;
+    std::cout << "  라운드: " << TestConfig::EQUIVALENCE_ROUNDS << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    std::mt19937_64 gen(0xE9U);
+    std::uniform_int_distribution<int> fieldCountDis(1, 60);
+    std::uniform_int_distribution<int> typeDis(0, 9);
+
+    struct Field { int type; uint64_t raw; };
+    std::vector<Field> fields;
+    fields.reserve(60);
+
+    uint64_t comparedBytes = 0;
+
+    for (uint64_t round = 1; round <= TestConfig::EQUIVALENCE_ROUNDS; ++round)
+    {
+        ::CSerialBuffer   origin(MSG_DEFAULT_SIZE);
+        Fixed::CSerialBuffer fixed(Fixed::MSG_DEFAULT_SIZE);
+
+        fields.clear();
+        const int fieldCount = fieldCountDis(gen);
+
+        // --- 같은 값 시퀀스를 양쪽에 똑같이 직렬화 ---
+        for (int f = 0; f < fieldCount; ++f)
+        {
+            Field field;
+            field.type = typeDis(gen);
+            field.raw = gen();
+            fields.push_back(field);
+
+            switch (field.type)
+            {
+            case 0: origin << (uint8_t)field.raw;  fixed << (uint8_t)field.raw;  break;
+            case 1: origin << (char)field.raw;     fixed << (char)field.raw;     break;
+            case 2: origin << (short)field.raw;    fixed << (short)field.raw;    break;
+            case 3: origin << (uint16_t)field.raw; fixed << (uint16_t)field.raw; break;
+            case 4: origin << (int)field.raw;      fixed << (int)field.raw;      break;
+            case 5: origin << (uint32_t)field.raw; fixed << (uint32_t)field.raw; break;
+            case 6: origin << (int64_t)field.raw;  fixed << (int64_t)field.raw;  break;
+            case 7: origin << (uint64_t)field.raw; fixed << (uint64_t)field.raw; break;
+            case 8:
+            {
+                const float value = (float)(field.raw % 100000) / 7.0f;
+                origin << value; fixed << value;
+                break;
+            }
+            default:
+            {
+                const double value = (double)(field.raw % 1000000) / 13.0;
+                origin << value; fixed << value;
+                break;
+            }
+            }
+        }
+
+        // --- 1. 크기와 페이로드 바이트가 동일해야 한다 ---
+        const int originSize = origin.GetDataSize();
+        const int fixedSize = fixed.GetDataSize();
+        TEST_ASSERT(originSize == fixedSize, "직렬화 크기가 두 구현에서 다름");
+        TEST_ASSERT(std::memcmp(origin.GetPayloadBufferPtr(), fixed.GetPayloadBufferPtr(),
+            (size_t)originSize) == 0, "직렬화 바이트가 두 구현에서 다름");
+        comparedBytes += (uint64_t)originSize;
+
+        // --- 2. 헤더 영역까지 포함한 전송 바이트도 동일해야 한다 ---
+        const short payloadLen = (short)originSize;
+        std::memcpy(origin.GetHeaderBufferPtr(), &payloadLen, HEADER_SIZE);
+        std::memcpy(fixed.GetHeaderBufferPtr(), &payloadLen, Fixed::HEADER_SIZE);
+        TEST_ASSERT(std::memcmp(origin.GetHeaderBufferPtr(), fixed.GetHeaderBufferPtr(),
+            (size_t)(HEADER_SIZE + originSize)) == 0, "헤더 포함 전송 바이트가 다름");
+
+        // --- 3. 교차 역직렬화: 수정본이 만든 바이트를 원본이 읽는다 ---
+        ::CSerialBuffer crossToOrigin(MSG_DEFAULT_SIZE);
+        std::memcpy(crossToOrigin.GetWriteBufferPtr(), fixed.GetPayloadBufferPtr(), (size_t)fixedSize);
+        TEST_ASSERT(crossToOrigin.MoveWritePos(fixedSize) == fixedSize, "교차 적재 실패(원본측)");
+
+        // --- 4. 반대 방향: 원본이 만든 바이트를 수정본이 읽는다 ---
+        Fixed::CSerialBuffer crossToFixed(Fixed::MSG_DEFAULT_SIZE);
+        std::memcpy(crossToFixed.GetWriteBufferPtr(), origin.GetPayloadBufferPtr(), (size_t)originSize);
+        TEST_ASSERT(crossToFixed.MoveWritePos(originSize) == originSize, "교차 적재 실패(수정본측)");
+
+        for (size_t f = 0; f < fields.size(); ++f)
+        {
+            const Field& field = fields[f];
+            switch (field.type)
+            {
+            case 0:
+            {
+                uint8_t a = 0, b = 0; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(a == (uint8_t)field.raw && b == (uint8_t)field.raw, "교차 역직렬화 uint8_t 불일치");
+                break;
+            }
+            case 1:
+            {
+                char a = 0, b = 0; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(a == (char)field.raw && b == (char)field.raw, "교차 역직렬화 char 불일치");
+                break;
+            }
+            case 2:
+            {
+                short a = 0, b = 0; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(a == (short)field.raw && b == (short)field.raw, "교차 역직렬화 short 불일치");
+                break;
+            }
+            case 3:
+            {
+                uint16_t a = 0, b = 0; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(a == (uint16_t)field.raw && b == (uint16_t)field.raw, "교차 역직렬화 uint16_t 불일치");
+                break;
+            }
+            case 4:
+            {
+                int a = 0, b = 0; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(a == (int)field.raw && b == (int)field.raw, "교차 역직렬화 int 불일치");
+                break;
+            }
+            case 5:
+            {
+                uint32_t a = 0, b = 0; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(a == (uint32_t)field.raw && b == (uint32_t)field.raw, "교차 역직렬화 uint32_t 불일치");
+                break;
+            }
+            case 6:
+            {
+                int64_t a = 0, b = 0; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(a == (int64_t)field.raw && b == (int64_t)field.raw, "교차 역직렬화 int64_t 불일치");
+                break;
+            }
+            case 7:
+            {
+                uint64_t a = 0, b = 0; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(a == field.raw && b == field.raw, "교차 역직렬화 uint64_t 불일치");
+                break;
+            }
+            case 8:
+            {
+                const float expected = (float)(field.raw % 100000) / 7.0f;
+                float a = 0.0f, b = 0.0f; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(std::memcmp(&a, &expected, sizeof(float)) == 0
+                    && std::memcmp(&b, &expected, sizeof(float)) == 0, "교차 역직렬화 float 불일치");
+                break;
+            }
+            default:
+            {
+                const double expected = (double)(field.raw % 1000000) / 13.0;
+                double a = 0.0, b = 0.0; crossToOrigin >> a; crossToFixed >> b;
+                TEST_ASSERT(std::memcmp(&a, &expected, sizeof(double)) == 0
+                    && std::memcmp(&b, &expected, sizeof(double)) == 0, "교차 역직렬화 double 불일치");
+                break;
+            }
+            }
+        }
+
+        TEST_ASSERT(crossToOrigin.GetDataSize() == 0 && crossToFixed.GetDataSize() == 0,
+            "교차 역직렬화 후 잔여 데이터 존재");
+
+        g_totalIterations++;
+        PrintProgress("동등성", round, TestConfig::EQUIVALENCE_ROUNDS);
+    }
+
+    // --- 5. 문자열도 길이 접두사까지 동일해야 한다 ---
+    {
+        const char* narrow = "MMO_Zone SerialBuffer equivalence";
+        const wchar_t* wide = L"직렬화 버퍼 동등성";
+
+        ::CSerialBuffer   origin(MSG_DEFAULT_SIZE);
+        Fixed::CSerialBuffer fixed(Fixed::MSG_DEFAULT_SIZE);
+
+        origin << narrow << wide;
+        fixed << narrow << wide;
+
+        TEST_ASSERT(origin.GetDataSize() == fixed.GetDataSize(), "문자열 직렬화 크기가 다름");
+        TEST_ASSERT(std::memcmp(origin.GetPayloadBufferPtr(), fixed.GetPayloadBufferPtr(),
+            (size_t)origin.GetDataSize()) == 0, "문자열 직렬화 바이트가 다름");
+    }
+    std::cout << "  [OK] 문자열(char*/wchar_t*) 길이 접두사까지 동일" << std::endl;
+
+    std::cout << "\n[PASS] 동등성 테스트 완료! (비교한 페이로드 " << comparedBytes << " 바이트)" << std::endl;
+    std::cout << "  → 수정본이 만든 패킷을 원본이 그대로 파싱한다 (양방향 확인)" << std::endl;
     g_testCount++;
 }
 
@@ -1964,8 +2173,10 @@ void PrintMenu()
     std::cout << " 16. Phase 3 전체 실행" << std::endl;
     std::cout << "\n[Phase 4: 잠재 결함 점검 (비파괴)]" << std::endl;
     std::cout << " 17. 알려진 위험 지점 점검" << std::endl;
+    std::cout << "\n[Phase 5: 원본 ↔ 수정본 동등성]" << std::endl;
+    std::cout << " 19. 동등성 / 와이어 호환 테스트" << std::endl;
     std::cout << "\n[전체]" << std::endl;
-    std::cout << " 18. 전체 실행 (Phase 1 + 2 + 3 + 4)" << std::endl;
+    std::cout << " 20. 전체 실행 (Phase 1 ~ 5)" << std::endl;
     std::cout << "  0. 종료" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "선택: ";
@@ -1987,7 +2198,7 @@ int main()
     std::cout << "        (락프리 TLS 프리리스트 검증은 LockFree 테스트에서)" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    CSerialBuffer::_TlsMsgFreeList = new LockFree::CExternalTlsFreeList<CSerialBuffer>();
+    UTBuffer::_TlsMsgFreeList = new LockFree::CExternalTlsFreeList<UTBuffer>();
 
     while (true)
     {
@@ -2049,7 +2260,8 @@ int main()
                 Test_MixedAddRef();
                 break;
             case 17: Test_KnownHazards(); break;
-            case 18:
+            case 19: Test_Equivalence(); break;
+            case 20:
                 std::cout << "\n[전체 테스트 실행]" << std::endl;
                 Test_BasicTypes();
                 Test_RandomMixed();
@@ -2065,6 +2277,7 @@ int main()
                 Test_ZeroTargetBroadcast();
                 Test_MixedAddRef();
                 Test_KnownHazards();
+                Test_Equivalence();
                 break;
             default:
                 std::cout << "\n잘못된 선택입니다." << std::endl;
@@ -2093,7 +2306,7 @@ int main()
         std::cout << "========================================" << std::endl;
     }
 
-    delete CSerialBuffer::_TlsMsgFreeList;
-    CSerialBuffer::_TlsMsgFreeList = nullptr;
+    delete UTBuffer::_TlsMsgFreeList;
+    UTBuffer::_TlsMsgFreeList = nullptr;
     return 0;
 }
