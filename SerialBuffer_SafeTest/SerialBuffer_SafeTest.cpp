@@ -1533,36 +1533,27 @@ void Test_KnownHazards()
         std::cout << "  Release() 후 버퍼 포인터가 그대로인가   : " << (danglingKept ? "예" : "아니오") << std::endl;
 
         TEST_WARN(!danglingKept,
-            "Release() 가 _Buff 를 null 로 만들지 않는다. public 이라 외부 호출이 가능하고 "
-            "소멸자도 Release() 를 부르므로 명시 호출 후 소멸 시 이중 해제가 된다. "
-            "→ 현재 외부 호출처는 없음(잠재). 사용 계약: Release() 를 직접 부르지 말 것");
+            "버퍼 수명 관리가 생성자/소멸자 밖으로 새어 있다. "
+            "(1) Release() 가 _Buff 를 null 로 만들지 않는데 public 이고 소멸자도 Release() 를 "
+            "부르므로, 명시 호출 후 소멸 시 이중 해제가 된다. "
+            "(2) Initialize() 도 이전 _Buff 를 해제하지 않고 덮어쓰므로 두 번 부르면 첫 버퍼가 샌다. "
+            "→ 둘 다 현재 외부 호출처 없음(잠재). "
+            "계약: Release()/Initialize() 를 직접 부르지 말 것 (생성자·소멸자에 맡길 것)");
 
         buffer.Initialize(64);   // 소멸자가 유효한 버퍼를 해제하도록 복구
     }
 
-    // --- 5. Initialize() 재호출 (B2) ---
+    // --- 5. Initialize() 재호출 (B2) — 실행 점검하지 않는 이유 ---
     //
     //   void Initialize(int BufferSize) { _Buff = new char[BufferSize]; ... }
     //
-    // 이전 _Buff 를 해제하지 않고 덮어쓴다. 두 번 부르면 첫 버퍼가 그대로 샌다.
-    // 테스트가 만든 누수는 첫 포인터를 보관해 두었다가 직접 회수한다.
-    {
-        CSerialBuffer buffer(64);
-        char* first = buffer.GetHeaderBufferPtr();
-
-        buffer.Initialize(128);
-        char* second = buffer.GetHeaderBufferPtr();
-
-        const bool replacedWithoutFree = (second != first);
-        std::cout << "  Initialize() 재호출이 버퍼를 교체하는가 : " << (replacedWithoutFree ? "예" : "아니오") << std::endl;
-
-        TEST_WARN(!replacedWithoutFree,
-            "Initialize() 가 이전 _Buff 를 해제하지 않고 덮어쓴다. 두 번 부르면 첫 버퍼가 누수된다. "
-            "→ 현재 외부 호출처는 없음(잠재). 사용 계약: Initialize() 는 생성 시 1회만");
-
-        if (replacedWithoutFree)
-            delete[] first;   // new char[] 로 할당된 메모리 — 테스트가 만든 누수를 직접 회수
-    }
+    // 이전 _Buff 를 해제하지 않고 덮어쓰므로 두 번 부르면 첫 버퍼가 샌다.
+    // 그런데 이 사실은 실행으로 안전하게 확인할 수 없다:
+    //   · "이전 버퍼가 해제됐는지"를 UB 없이 관찰할 방법이 없고,
+    //   · 테스트가 대신 delete[] 해 주면, 나중에 원본이 고쳐졌을 때 그 해제가
+    //     이중 해제가 되어 테스트가 수정을 방해한다.
+    // 초기 버전이 실제로 그렇게 짜여 있었고 역방향 뮤테이션(고치면 경고가
+    // 사라지는지 확인)에서 걸렸다. 그래서 위 B1 경고문에 사실로 병기만 한다.
 
     // --- 6. 문자열 길이 오버플로우 (B3) ---
     //
