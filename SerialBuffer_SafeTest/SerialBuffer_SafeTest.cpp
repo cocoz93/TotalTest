@@ -10,7 +10,23 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+//=============================================================================
+// 테스트 대상 선택
+//   기본                      → SerialBuffer.h/.cpp  (MMOServer 원본 사본)
+//   -DUSE_FIXED_SERIALBUFFER  → SerialBuffer_Fixed.h/.cpp (수정본)
+//
+// 아래 테스트 본문은 두 경우 모두 한 글자도 바뀌지 않는다.
+// 수정본은 namespace Fixed 안에 있으므로, 원본 헤더를 포함하지 않는 빌드에서만
+// 전역 이름 CSerialBuffer 로 별칭을 건다.
+//=============================================================================
+#ifdef USE_FIXED_SERIALBUFFER
+#include "SerialBuffer_Fixed.h"
+using CSerialBuffer = Fixed::CSerialBuffer;
+static constexpr int HEADER_SIZE = Fixed::HEADER_SIZE;
+static constexpr int MSG_DEFAULT_SIZE = Fixed::MSG_DEFAULT_SIZE;
+#else
 #include "SerialBuffer.h"
+#endif
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -587,9 +603,17 @@ void Test_InvalidArguments()
         CSerialBuffer buffer(128);
         buffer << (int)0;
 
+        // 0 바이트 요청은 언제나 가능해야 한다 — 이건 계약이다
         TEST_ASSERT(buffer.IsEmpty(0) == false, "IsEmpty(0) 이 true");
         TEST_ASSERT(buffer.IsFull(0) == false, "빈 버퍼에서 IsFull(0) 이 true");
-        TEST_ASSERT(buffer.IsEmpty(-1) == false, "IsEmpty(-1) 이 true");
+
+        // 음수 입력의 반환값은 계약이 아니라 관찰 대상이다.
+        //   거부(true)가 옳은 동작이고, 통과(false)면 위 2·3번처럼 상태가 망가진다.
+        //   어느 쪽이든 어서션으로 고정하지 않는다 — 고정하면 나중에 가드를 넣을 때
+        //   테스트가 수정을 막는다 (B2 에서 겪은 함정).
+        std::cout << "  IsEmpty(-1) / IsFull(-1)                : "
+            << (buffer.IsEmpty(-1) ? "거부" : "통과") << " / "
+            << (buffer.IsFull(-1) ? "거부" : "통과") << std::endl;
     }
     std::cout << "  [OK] IsEmpty/IsFull 의 0·음수 입력 동작 기록" << std::endl;
 
@@ -1755,8 +1779,14 @@ void Test_KnownHazards()
         std::cout << "  초과 반납 후 RefCount                  : " << msg->_RefCount.load() << std::endl;
         std::cout << "  회수(Free) 되었는가                    : " << (freed ? "예" : "아니오") << std::endl;
 
+#ifdef USE_FIXED_SERIALBUFFER
+        // 수정본은 되돌리지는 못해도 검출은 한다
+        TEST_ASSERT(msg->HasRefUnderflow(), "수정본이 초과 반납을 검출하지 못함");
+        std::cout << "  (수정본) 초과 반납 검출 플래그         : 섰음 — 조용하지 않음" << std::endl;
+#endif
+
         TEST_WARN(freed,
-            "소유권을 초과 반납하면 Free 가 호출되지 않아 버퍼가 조용히 누수된다 "
+            "소유권을 초과 반납하면 Free 가 호출되지 않아 버퍼가 누수된다 "
             "(SubRef 는 fetch_sub 결과가 정확히 1일 때만 회수). "
             "→ 사용 계약: AddRef 횟수와 SubRef 횟수를 정확히 맞출 것");
 
@@ -1852,6 +1882,11 @@ void Test_KnownHazards()
         // 오염은 없어야 한다 — 이건 통과해야 할 조건
         TEST_ASSERT(silentlyIgnored, "크기 초과 복사가 대상 버퍼를 오염시킴");
 
+#ifdef USE_FIXED_SERIALBUFFER
+        TEST_ASSERT(dst.HasCopyFailed(), "수정본이 복사 실패를 표시하지 못함");
+        std::cout << "  (수정본) 복사 실패 플래그               : 섰음 — 호출부가 확인 가능" << std::endl;
+#endif
+
         TEST_WARN(!silentlyIgnored,
             "operator= 는 대상 버퍼가 작으면 복사를 건너뛰지만 반환값이 없어 호출부가 실패를 알 수 없다. "
             "복사됐다고 믿고 쓰면 빈 버퍼를 전송하게 된다. "
@@ -1943,7 +1978,11 @@ int main()
 {
     std::cout << "========================================" << std::endl;
     std::cout << "  CSerialBuffer 통합 테스트 시스템" << std::endl;
-    std::cout << "  대상: MMOServer/MMOServer/SerialBuffer.{h,cpp} (원본 사본)" << std::endl;
+#ifdef USE_FIXED_SERIALBUFFER
+    std::cout << "  대상: SerialBuffer_Fixed.{h,cpp}  ← 수정본" << std::endl;
+#else
+    std::cout << "  대상: SerialBuffer.{h,cpp}  ← MMOServer 원본 사본" << std::endl;
+#endif
     std::cout << "  주의: 프리리스트는 테스트용 new/delete 대체본" << std::endl;
     std::cout << "        (락프리 TLS 프리리스트 검증은 LockFree 테스트에서)" << std::endl;
     std::cout << "========================================" << std::endl;

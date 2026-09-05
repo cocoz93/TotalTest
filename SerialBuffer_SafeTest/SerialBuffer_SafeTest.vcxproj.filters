@@ -12,6 +12,9 @@
     <Filter Include="테스트 대상(원본 사본)">
       <UniqueIdentifier>{8A1E1B0C-4C2E-4A6D-9E77-2C7C1E5B9A31}</UniqueIdentifier>
     </Filter>
+    <Filter Include="수정본">
+      <UniqueIdentifier>{2B7C9E4D-1F63-4E88-A0D5-71C3B9F2A648}</UniqueIdentifier>
+    </Filter>
     <Filter Include="테스트용 대체 헤더">
       <UniqueIdentifier>{D3F4A2B1-7E58-4B0A-9C21-6F0D8E4A7C52}</UniqueIdentifier>
     </Filter>
@@ -23,10 +26,16 @@
     <ClCompile Include="SerialBuffer.cpp">
       <Filter>테스트 대상(원본 사본)</Filter>
     </ClCompile>
+    <ClCompile Include="SerialBuffer_Fixed.cpp">
+      <Filter>수정본</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="SerialBuffer.h">
       <Filter>테스트 대상(원본 사본)</Filter>
+    </ClInclude>
+    <ClInclude Include="SerialBuffer_Fixed.h">
+      <Filter>수정본</Filter>
     </ClInclude>
     <ClInclude Include="LockFreeConfig.h">
       <Filter>테스트용 대체 헤더</Filter>

@@ -129,9 +129,11 @@
   <ItemGroup>
     <ClCompile Include="SerialBuffer_SafeTest.cpp" />
     <ClCompile Include="SerialBuffer.cpp" />
+    <ClCompile Include="SerialBuffer_Fixed.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="SerialBuffer.h" />
+    <ClInclude Include="SerialBuffer_Fixed.h" />
     <ClInclude Include="LockFreeConfig.h" />
     <ClInclude Include="Platform\Platform.h" />
   </ItemGroup>

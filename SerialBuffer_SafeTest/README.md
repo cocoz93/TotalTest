@@ -25,11 +25,31 @@
 SerialBuffer_SafeTest/
 ├── SerialBuffer_SafeTest.sln
 ├── SerialBuffer_SafeTest.vcxproj
-├── SerialBuffer_SafeTest.cpp     ← 테스트 코드
+├── SerialBuffer_SafeTest.cpp     ← 테스트 코드 (두 대상에 공통)
 ├── SerialBuffer.h                ← 테스트 대상 (원본 사본, 수정 금지)
 ├── SerialBuffer.cpp              ← 테스트 대상 (원본 사본, 수정 금지)
+├── SerialBuffer_Fixed.h          ← 수정본 (namespace Fixed)
+├── SerialBuffer_Fixed.cpp        ← 수정본
 ├── LockFreeConfig.h              ← 테스트용 대체 헤더
 └── Platform/Platform.h           ← 테스트용 대체 헤더
+
+[대상 전환]
+  기본 빌드                      → SerialBuffer.h/.cpp  (원본 사본)
+  USE_FIXED_SERIALBUFFER 정의    → SerialBuffer_Fixed.h/.cpp (수정본)
+
+  VS  : 프로젝트 속성 → C/C++ → 전처리기 → 전처리기 정의에
+        USE_FIXED_SERIALBUFFER 추가 (두 .cpp 는 네임스페이스가 달라
+        함께 컴파일해도 충돌하지 않는다 — 제외 설정 불필요)
+  g++ : -DUSE_FIXED_SERIALBUFFER
+
+  테스트 본문은 두 경우 모두 한 글자도 바뀌지 않는다.
+  같은 14종을 두 버전에 그대로 돌려 결과를 비교한다.
+
+[왜 원본 사본을 고치지 않고 따로 두는가]
+  사본을 고치면 서버가 돌리지 않는 코드를 검증하게 된다. 테스트는 전부
+  초록불인데 서버에는 결함이 그대로 남는 상태가 가장 위험하다.
+  Phase 4 가 기록하는 "실제 서버가 지금 이렇다"도 함께 사라진다.
+  RingBuffer.h 가 149줄 갈라진 것이 정확히 이 경로였다.
 
 [원본]
   MMO/MMOServer/MMOServer/SerialBuffer.{h,cpp} 를 바이트 단위로 그대로 복사한 것.
@@ -173,6 +193,31 @@ SerialBuffer_SafeTest/
      MoveReadPos(-1) 은 없던 데이터가 있는 것처럼 DataSize 를 늘린다.
      둘 다 "성공"처럼 보이는 값을 돌려준다.
      → IsFull/IsEmpty 에 음수 가드를 넣으면 함께 막힌다
+
+[수정본이 반영한 것 — Phase 4 경고 7건 → 2건]
+
+  코드로 해소 (5건)
+    · IsFull 을 _rear 기준 + 음수·용량 가드로  → 1) 재사용 시 버퍼 밖 쓰기
+                                                 5) 문자열 길이 오버플로우
+                                                 7) 음수 크기 위치 이동
+                                                    (MoveReadPos 는 IsEmpty 를
+                                                     거치지 않아 별도 가드 필요)
+                                                 극소 버퍼의 "우연한" 안전
+    · _Buff 기본 초기화 + Release() 가 null 로 + Initialize() 가 이전 버퍼 해제
+                                              → 4) 버퍼 수명 관리
+    · operator= 복사 길이를 HEADER_SIZE + _rear 로
+                                              → 2) 부분 읽기 상태 복사 유실
+
+  진단만 추가 (2건, 자동 복구 불가)
+    · 3) 소유권 초과 반납 — 이미 0 이하로 내려간 뒤라 되돌릴 수 없다.
+         조용히 새는 대신 HasRefUnderflow() 로 검출 가능하게 했다.
+    · 6) operator= 조용한 실패 — 반환값으로 알릴 수 없다.
+         HasCopyFailed() 로 호출부가 확인할 수 있게 했다.
+    ※ 둘 다 원본에 없던 API 다. 실제 서버에 반영할 때는 assert 나 로그가 낫다
+      (테스트는 죽으면 안 되므로 여기서는 플래그를 썼다).
+
+  검증: 두 버전 모두 14종 PASS. 수정본 ASan·TSan 클린.
+        원본 경고 7건 → 수정본 2건 (남은 2건은 위 진단 항목).
 
 [반복 횟수 조절]
   SerialBuffer_SafeTest.cpp 상단 namespace TestConfig 의 상수를 수정한다.
