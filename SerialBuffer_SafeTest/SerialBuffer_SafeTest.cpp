@@ -1512,6 +1512,108 @@ void Test_KnownHazards()
         TEST_ASSERT(Pool()->GetLiveCount() == 0, "A4 점검 후 정리 실패");
     }
 
+    // --- 4. Release() 이중 호출 (B1) ---
+    //
+    //   void Release(void) { delete[] _Buff; }   // _Buff 를 null 로 만들지 않는다
+    //   ~CSerialBuffer()   { Release(); }        // 소멸자도 같은 함수를 부른다
+    //
+    // Release() 가 public 이라 외부에서 부를 수 있고, 그 뒤 소멸하면 두 번째 delete[] 가 일어난다.
+    // 실제로 이중 해제를 일으키면 프로세스가 죽으므로 "Release() 후에도 포인터가 그대로 남는지"만
+    // 확인하고(역참조하지 않는다), 곧바로 Initialize() 로 새 버퍼를 물려 소멸자를 안전하게 만든다.
+    {
+        CSerialBuffer buffer(64);
+        char* before = buffer.GetHeaderBufferPtr();
+        TEST_ASSERT(before != nullptr, "초기 버퍼가 nullptr");
+
+        buffer.Release();
+
+        char* after = buffer.GetHeaderBufferPtr();   // 값만 비교, 역참조 금지
+        const bool danglingKept = (after == before);
+
+        std::cout << "  Release() 후 버퍼 포인터가 그대로인가   : " << (danglingKept ? "예" : "아니오") << std::endl;
+
+        TEST_WARN(!danglingKept,
+            "Release() 가 _Buff 를 null 로 만들지 않는다. public 이라 외부 호출이 가능하고 "
+            "소멸자도 Release() 를 부르므로 명시 호출 후 소멸 시 이중 해제가 된다. "
+            "→ 현재 외부 호출처는 없음(잠재). 사용 계약: Release() 를 직접 부르지 말 것");
+
+        buffer.Initialize(64);   // 소멸자가 유효한 버퍼를 해제하도록 복구
+    }
+
+    // --- 5. Initialize() 재호출 (B2) ---
+    //
+    //   void Initialize(int BufferSize) { _Buff = new char[BufferSize]; ... }
+    //
+    // 이전 _Buff 를 해제하지 않고 덮어쓴다. 두 번 부르면 첫 버퍼가 그대로 샌다.
+    // 테스트가 만든 누수는 첫 포인터를 보관해 두었다가 직접 회수한다.
+    {
+        CSerialBuffer buffer(64);
+        char* first = buffer.GetHeaderBufferPtr();
+
+        buffer.Initialize(128);
+        char* second = buffer.GetHeaderBufferPtr();
+
+        const bool replacedWithoutFree = (second != first);
+        std::cout << "  Initialize() 재호출이 버퍼를 교체하는가 : " << (replacedWithoutFree ? "예" : "아니오") << std::endl;
+
+        TEST_WARN(!replacedWithoutFree,
+            "Initialize() 가 이전 _Buff 를 해제하지 않고 덮어쓴다. 두 번 부르면 첫 버퍼가 누수된다. "
+            "→ 현재 외부 호출처는 없음(잠재). 사용 계약: Initialize() 는 생성 시 1회만");
+
+        if (replacedWithoutFree)
+            delete[] first;   // new char[] 로 할당된 메모리 — 테스트가 만든 누수를 직접 회수
+    }
+
+    // --- 6. 문자열 길이 오버플로우 (B3) ---
+    //
+    //   short Len = (short)strlen(Value);
+    //   if (IsFull(sizeof(Len) + Len)) return *this;
+    //
+    // 32767 을 넘는 문자열이면 Len 이 음수가 되고, 그 음수가 그대로 가드 계산에 들어간다.
+    // 실제로 쓰기를 시키면 SetData 가 음수 크기로 _rear 를 뒤로 밀어 버퍼 앞쪽 밖을 건드리므로,
+    // 여기서는 가드가 막아주는지만 계산으로 확인한다 (쓰기는 실행하지 않는다).
+    {
+        const size_t hugeLength = 40000;              // 32767 초과
+        const short truncated = (short)hugeLength;    // 음수로 잘린다
+
+        CSerialBuffer big((int)hugeLength + 16);
+        const bool guardBlocks = big.IsFull((int)(sizeof(short) + truncated));
+
+        std::cout << "  40000자 문자열의 기록 길이              : " << truncated << std::endl;
+        std::cout << "  IsFull 가드가 막아주는가                : " << (guardBlocks ? "예" : "아니오") << std::endl;
+
+        TEST_WARN(truncated > 0 || guardBlocks,
+            "32767 을 넘는 문자열은 길이가 음수로 잘리고 그 음수가 IsFull 계산에 그대로 들어가 "
+            "가드를 통과한다. 뒤이은 SetData 가 음수 크기로 _rear 를 뒤로 민다. "
+            "→ 기본 버퍼(1460)에서는 도달 불가. 32KB 이상 버퍼를 쓸 때만 위험");
+    }
+
+    // --- 7. operator= 크기 초과 시 조용한 실패 (B4) ---
+    //
+    //   int srcTotalSize = HEADER_SIZE + SrcMsg._DataSize;
+    //   if (srcTotalSize > _BufferSize) return *this;   // 아무 표시 없이 무시
+    {
+        CSerialBuffer src(1000);
+        for (int i = 0; i < 100; ++i)
+            src << (int)i;                 // 400 바이트
+
+        CSerialBuffer dst(64);             // 담을 수 없는 크기
+        const int beforeSize = dst.GetDataSize();
+        dst = src;
+        const int afterSize = dst.GetDataSize();
+
+        const bool silentlyIgnored = (afterSize == beforeSize);
+        std::cout << "  담을 수 없는 복사가 무시되었는가        : " << (silentlyIgnored ? "예" : "아니오") << std::endl;
+
+        // 오염은 없어야 한다 — 이건 통과해야 할 조건
+        TEST_ASSERT(silentlyIgnored, "크기 초과 복사가 대상 버퍼를 오염시킴");
+
+        TEST_WARN(!silentlyIgnored,
+            "operator= 는 대상 버퍼가 작으면 복사를 건너뛰지만 반환값이 없어 호출부가 실패를 알 수 없다. "
+            "복사됐다고 믿고 쓰면 빈 버퍼를 전송하게 된다. "
+            "→ 사용 계약: 복사 대입 전 대상 버퍼 크기를 직접 확인할 것");
+    }
+
     if (g_warnCount.load() == 0)
         std::cout << "\n[PASS] 잠재 결함 점검 — 경고 없음" << std::endl;
     else
