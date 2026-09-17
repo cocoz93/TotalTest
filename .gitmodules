@@ -1,0 +1,3 @@
+[submodule "ServerCore"]
+	path = ServerCore
+	url = https://github.com/cocoz93/ServerCore.git
