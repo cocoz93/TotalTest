@@ -115,3 +115,7 @@ git submodule update --init          # 이미 받았다면 이것만
 | [LockFree](https://github.com/cocoz93/LockFree) | 락프리 큐·스택 + 2계층 메모리풀 |
 
 코딩 규약은 [CONTRIBUTING.md](CONTRIBUTING.md) 에 있습니다.
+
+## 라이선스
+
+© 2026 주우진 · 저작권 보유. 열람용으로 공개합니다.
